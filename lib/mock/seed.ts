@@ -60,38 +60,38 @@ function atDate(day: Date, hour: number, minute = 0): string {
 export const FAMILY_MEMBERS: FamilyMember[] = [
   {
     id: "aman",
-    name: "Aman",
+    name: "Vijay",
     imessageHandle: "+1 (512) 555-0142",
     phone: "+1 (512) 555-0142",
-    color: "blue",
-    aliases: ["Dad", "Aman L"],
+    color: "violet",
+    aliases: ["Vijay", "Papa", "Dad"],
     createdAt: new Date(2024, 8, 1).toISOString(),
   },
   {
     id: "priya",
-    name: "Priya",
-    imessageHandle: "priya.luthra@icloud.com",
+    name: "Ekta",
+    imessageHandle: "ekta.luthra@icloud.com",
     phone: "+1 (512) 555-0198",
-    color: "violet",
-    aliases: ["Mom", "P"],
+    color: "rose",
+    aliases: ["Ekta", "Mai", "Mom"],
     createdAt: new Date(2024, 8, 1).toISOString(),
   },
   {
     id: "maya",
-    name: "Maya",
+    name: "Aman",
     imessageHandle: "+1 (512) 555-0110",
     phone: "+1 (512) 555-0110",
-    color: "rose",
-    aliases: ["May", "Maya L"],
+    color: "blue",
+    aliases: ["Aman"],
     createdAt: new Date(2024, 8, 1).toISOString(),
   },
   {
     id: "kiran",
-    name: "Kiran",
+    name: "Yash",
     imessageHandle: "+1 (512) 555-0177",
     phone: "+1 (512) 555-0177",
     color: "teal",
-    aliases: ["KK", "Kiddo"],
+    aliases: ["Yash"],
     createdAt: new Date(2024, 8, 1).toISOString(),
   },
 ];
@@ -166,7 +166,7 @@ function buildEvents(): LuthEvent[] {
     createdVia: "calendar_app",
   });
 
-  // Deliberate visible conflict: Maya's dentist appointment overlaps her
+  // Deliberate visible conflict: Aman's dentist appointment overlaps his
   // piano lesson by 30 minutes on the same afternoon. Referenced by id from
   // DIGESTS and ACTIVITY below, and surfaced via findConflictingEventIds().
   events.push({
@@ -300,20 +300,20 @@ export const DIGESTS: DigestEntry[] = [
     id: "dig-0",
     kind: "announcement",
     sentAt: at(weekStart, 2, 9, 12),
-    text: 'Added "Dentist appointment" for Maya — Tuesday at 3:00 PM. Heads up: this overlaps with her piano lesson at 3:30 PM.',
+    text: 'Added "Dentist appointment" for Aman — Tuesday at 3:00 PM. Heads up: this overlaps with his piano lesson at 3:30 PM.',
     relatedEventIds: ["evt-dentist", "evt-piano"],
   },
   {
     id: "dig-1",
     kind: "daily",
     sentAt: daysAgo(1, 7, 30),
-    text: "Good morning! Today: Kiran has soccer practice at 5:30 PM, and family dinner is Friday at 6:30. Nothing else on the books.",
+    text: "Good morning! Today: Yash has soccer practice at 5:30 PM, and family dinner is Friday at 6:30. Nothing else on the books.",
   },
   {
     id: "dig-2",
     kind: "announcement",
     sentAt: daysAgo(2, 14, 5),
-    text: 'Added "Work trip — Denver" for Priya, Wednesday through Friday.',
+    text: 'Added "Work trip — Denver" for Ekta, Wednesday through Friday.',
   },
   {
     id: "dig-3",
@@ -325,7 +325,7 @@ export const DIGESTS: DigestEntry[] = [
     id: "dig-4",
     kind: "weekly",
     sentAt: daysAgo(3, 18, 0),
-    text: "This week: soccer Tue/Thu, guitar Wed, dentist + piano for Maya Tuesday afternoon (back-to-back — might be tight), family dinner Friday, and Theo's birthday party Saturday morning.",
+    text: "This week: soccer Tue/Thu, guitar Wed, dentist + piano for Aman Tuesday afternoon (back-to-back — might be tight), family dinner Friday, and Theo's birthday party Saturday morning.",
   },
   {
     id: "dig-5",
@@ -337,7 +337,7 @@ export const DIGESTS: DigestEntry[] = [
     id: "dig-6",
     kind: "announcement",
     sentAt: daysAgo(4, 20, 44),
-    text: 'Added "Theo\'s birthday party" for Kiran — Saturday at 10:00 AM at Bounce House Austin.',
+    text: 'Added "Theo\'s birthday party" for Yash — Saturday at 10:00 AM at Bounce House Austin.',
   },
   {
     id: "dig-7",
@@ -349,7 +349,7 @@ export const DIGESTS: DigestEntry[] = [
     id: "dig-8",
     kind: "announcement",
     sentAt: daysAgo(6, 8, 0),
-    text: "Reminder sent: Maya's orthodontist consult is in 24 hours (Thursday, 7:00 PM).",
+    text: "Reminder sent: Aman's orthodontist consult is in 24 hours (Thursday, 7:00 PM).",
   },
   {
     id: "dig-9",
@@ -367,11 +367,11 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-0",
     direction: "inbound",
-    sender: "Priya",
-    text: "Maya has dentist Tuesday 3pm",
+    sender: "Ekta",
+    text: "Aman has dentist Tuesday 3pm",
     action: {
       type: "create_event",
-      summary: 'Created "Dentist appointment" for Maya — Tue 3:00–4:00 PM',
+      summary: 'Created "Dentist appointment" for Aman — Tue 3:00–4:00 PM',
       eventId: "evt-dentist",
     },
     createdAt: at(weekStart, 2, 9, 10),
@@ -380,7 +380,7 @@ export const ACTIVITY: ActivityEntry[] = [
     id: "act-1",
     direction: "outbound",
     sender: "Agent",
-    text: "Got it — added Maya's dentist appointment for Tuesday at 3pm. Heads up, that overlaps with her piano lesson at 3:30.",
+    text: "Got it — added Aman's dentist appointment for Tuesday at 3pm. Heads up, that overlaps with his piano lesson at 3:30.",
     action: {
       type: "flag_conflict",
       summary: "Flagged overlap with existing piano lesson",
@@ -391,7 +391,7 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-2",
     direction: "inbound",
-    sender: "Aman",
+    sender: "Vijay",
     text: "can everyone make soccer thurs? want to grab food after",
     action: {
       type: "no_action",
@@ -402,7 +402,7 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-3",
     direction: "inbound",
-    sender: "Priya",
+    sender: "Ekta",
     text: "move family dinner friday to 6:30 instead of 6",
     action: {
       type: "update_event",
@@ -420,8 +420,8 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-5",
     direction: "inbound",
-    sender: "Priya",
-    text: "kiran has ortho next thurs 7pm, quick consult",
+    sender: "Ekta",
+    text: "aman has ortho next thurs 7pm, quick consult",
     action: {
       type: "create_event",
       summary: 'Created "Orthodontist consult" — Thu 7:00–7:45 PM',
@@ -432,7 +432,7 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-6",
     direction: "inbound",
-    sender: "Aman",
+    sender: "Vijay",
     text: "book something for the kiddo tomorrow at 2",
     action: {
       type: "needs_clarification",
@@ -444,17 +444,17 @@ export const ACTIVITY: ActivityEntry[] = [
     id: "act-7",
     direction: "outbound",
     sender: "Agent",
-    text: "Quick check — is that for Maya or Kiran, and what's the appointment? I don't want to guess and get it wrong.",
+    text: "Quick check — is that for Aman or Yash, and what's the appointment? I don't want to guess and get it wrong.",
     createdAt: daysAgo(3, 21, 2),
   },
   {
     id: "act-8",
     direction: "inbound",
-    sender: "Maya",
+    sender: "Aman",
     text: "ITS ME! swim meet is on the 26th at 9am at the northwest rec center",
     action: {
       type: "create_event",
-      summary: 'Created "Swim meet" for Maya — 9:00 AM–12:00 PM',
+      summary: 'Created "Swim meet" for Aman — 9:00 AM–12:00 PM',
       eventId: "evt-swim",
     },
     createdAt: daysAgo(4, 16, 18),
@@ -463,7 +463,7 @@ export const ACTIVITY: ActivityEntry[] = [
     id: "act-9",
     direction: "outbound",
     sender: "Agent",
-    text: "Reminder: Maya's orthodontist consult is tomorrow at 7:00 PM.",
+    text: "Reminder: Aman's orthodontist consult is tomorrow at 7:00 PM.",
     action: {
       type: "send_reminder",
       summary: "24-hour reminder sent to the group chat",
@@ -474,7 +474,7 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-10",
     direction: "inbound",
-    sender: "Priya",
+    sender: "Ekta",
     text: "denver trip is actually wed-fri not thu-fri, can you fix it",
     action: {
       type: "update_event",
@@ -485,7 +485,7 @@ export const ACTIVITY: ActivityEntry[] = [
   {
     id: "act-11",
     direction: "inbound",
-    sender: "Aman",
+    sender: "Vijay",
     text: "asdkfj ignore that last one, fat fingered the group chat",
     action: {
       type: "no_action",
