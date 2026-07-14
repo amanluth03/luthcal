@@ -2,29 +2,39 @@ import { eq } from "drizzle-orm";
 import { getDb } from "../lib/db";
 import { familyMembers } from "../lib/db/schema";
 
-// PLACEHOLDER family data — replace with the real family roster (names,
-// iMessage handles, phone numbers, colors, aliases) before going live.
+// The Luthra family roster. iMessage handles (phone/Apple email) are still
+// TODO for most members — fill them in before go-live so outbound texts and
+// inbound sender→member matching work. Note: "son" is intentionally NOT an
+// alias of either Aman or Yash — it's ambiguous between them, so the agent
+// should ask which son rather than guess.
 const members = [
   {
     name: "Aman",
     imessageHandle: "amanluth03@gmail.com",
     phone: null,
-    color: "#3b82f6",
+    color: "#3b82f6", // blue
     aliases: ["Aman"],
   },
   {
-    name: "PLACEHOLDER_MEMBER_2",
+    name: "Yash",
     imessageHandle: null,
     phone: null,
-    color: "#ef4444",
-    aliases: ["PLACEHOLDER_MEMBER_2"],
+    color: "#14b8a6", // teal
+    aliases: ["Yash"],
   },
   {
-    name: "PLACEHOLDER_MEMBER_3",
+    name: "Vijay",
     imessageHandle: null,
     phone: null,
-    color: "#22c55e",
-    aliases: ["PLACEHOLDER_MEMBER_3"],
+    color: "#8b5cf6", // violet
+    aliases: ["Vijay", "Papa", "Dad"],
+  },
+  {
+    name: "Ekta",
+    imessageHandle: null,
+    phone: null,
+    color: "#f43f5e", // rose
+    aliases: ["Ekta", "Mai", "Mom"],
   },
 ];
 
