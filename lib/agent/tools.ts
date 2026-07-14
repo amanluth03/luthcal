@@ -8,6 +8,7 @@ import {
   listEvents as gListEvents,
   updateEvent as gUpdateEvent,
 } from "@/lib/google/events";
+import { matchMember, type RosterMember } from "./match-member";
 import { enqueueOutbound } from "./outbound";
 
 /** Where this agent run originated. Determines event_meta.created_via and the announcement path — see docs/agent-core.md. */
@@ -17,7 +18,48 @@ export interface AgentToolContext {
   source: AgentSource;
   /** The iMessage group chat this run is attached to. Required for source "imessage"; sendGroupMessage falls back to FAMILY_CHAT_GUID otherwise. */
   chatGuid?: string;
+  /** The family roster this run resolved at prompt-build time — reused here (rather than re-fetched) so createEvent/updateEvent can deterministically resolve memberNames -> ids against the exact same roster the model was shown. */
+  roster: RosterMember[];
 }
+
+/**
+ * Resolves each of `names` against `roster` via `matchMember` (see
+ * lib/agent/match-member.ts). This is the deterministic member-matching
+ * backstop documented in docs/agent-core.md §2: the model never emits a
+ * `family_members.id` directly for createEvent/updateEvent — it emits the
+ * name/alias text it read in the conversation, and *this* function, not the
+ * model, decides what id that resolves to. A name that matches more than
+ * one roster member short-circuits the whole batch and reports back which
+ * one, so a wrong-person event can't be created just because the model
+ * would have guessed.
+ *
+ * A name that matches nobody on the roster (`kind: "none"`) is not treated
+ * as an error — it's dropped (contributes no id) and reported back in
+ * `unresolved`, since it's just as likely to be a real non-family person
+ * (a friend's name in "playdate with Emma") as a typo.
+ */
+function resolveMemberNames(
+  names: string[],
+  roster: RosterMember[],
+): { memberIds: string[]; unresolved: string[] } | { ambiguousName: string; candidates: RosterMember[] } {
+  const memberIds: string[] = [];
+  const unresolved: string[] = [];
+  for (const name of names) {
+    const result = matchMember(name, roster);
+    if (result.kind === "ambiguous") {
+      return { ambiguousName: name, candidates: result.candidates };
+    }
+    if (result.kind === "unique") {
+      if (!memberIds.includes(result.member.id)) memberIds.push(result.member.id);
+    } else {
+      unresolved.push(name);
+    }
+  }
+  return { memberIds, unresolved };
+}
+
+const memberNamesDescription =
+  "Family member name(s)/alias(es) this event is for, exactly as referenced in the conversation and matching the roster above (e.g. 'Maya', 'mom') — NOT a family_members.id. Resolved deterministically server-side; if a name matches more than one roster member, the call returns an ambiguousMember result instead of a created/updated event and you must ask the user which person they meant rather than guessing, then call this tool again once they've clarified.";
 
 // Dates: tools accept ISO 8601. The agent resolves natural language ("next
 // Tuesday at 3", "tomorrow morning") into ISO using the current date/time
@@ -62,22 +104,32 @@ export function buildAgentTools(ctx: AgentToolContext) {
         startISO: isoDateTime,
         endISO: endISOWithAllDayNote,
         allDay: z.boolean().optional().describe("True for all-day events. Defaults to false."),
-        memberIds: z.array(z.string()).describe("family_members.id values this event is for."),
+        memberNames: z.array(z.string()).describe(memberNamesDescription),
         notes: z.string().optional(),
         location: z.string().optional(),
       }),
-      execute: async ({ title, startISO, endISO, allDay, memberIds, notes, location }) => {
+      execute: async ({ title, startISO, endISO, allDay, memberNames, notes, location }) => {
+        const resolved = resolveMemberNames(memberNames, ctx.roster);
+        if ("ambiguousName" in resolved) {
+          return {
+            ambiguousMember: {
+              name: resolved.ambiguousName,
+              candidates: resolved.candidates.map((c) => ({ id: c.id, name: c.name })),
+            },
+          };
+        }
+
         const event = await gCreateEvent({
           title,
           startISO,
           endISO,
           allDay,
-          memberIds,
+          memberIds: resolved.memberIds,
           notes,
           location,
           createdVia: ctx.source,
         });
-        return { event };
+        return { event, unresolvedMemberNames: resolved.unresolved.length > 0 ? resolved.unresolved : undefined };
       },
     }),
 
@@ -90,12 +142,26 @@ export function buildAgentTools(ctx: AgentToolContext) {
         startISO: isoDateTime.optional(),
         endISO: endISOWithAllDayNote.optional(),
         allDay: z.boolean().optional(),
-        memberIds: z.array(z.string()).optional(),
+        memberNames: z.array(z.string()).optional().describe(`${memberNamesDescription} Omit entirely to leave the event's current members unchanged.`),
         notes: z.string().optional(),
         location: z.string().optional(),
       }),
-      execute: async (input) => {
-        const event = await gUpdateEvent(input);
+      execute: async ({ googleEventId, title, startISO, endISO, allDay, memberNames, notes, location }) => {
+        let memberIds: string[] | undefined;
+        if (memberNames) {
+          const resolved = resolveMemberNames(memberNames, ctx.roster);
+          if ("ambiguousName" in resolved) {
+            return {
+              ambiguousMember: {
+                name: resolved.ambiguousName,
+                candidates: resolved.candidates.map((c) => ({ id: c.id, name: c.name })),
+              },
+            };
+          }
+          memberIds = resolved.memberIds;
+        }
+
+        const event = await gUpdateEvent({ googleEventId, title, startISO, endISO, allDay, memberIds, notes, location });
         return { event };
       },
     }),

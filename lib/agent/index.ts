@@ -6,6 +6,7 @@ import { familyMembers, messageLog } from "@/lib/db/schema";
 import { checkConflicts } from "@/lib/google/conflicts";
 import { formatNowForPrompt, getFamilyTimeZone } from "@/lib/google/time";
 import type { LuthEvent } from "@/lib/google/types";
+import type { RosterMember } from "./match-member";
 import { buildAgentTools, type AgentSource } from "./tools";
 
 // Model is addressed via a Vercel AI Gateway string, resolved by the
@@ -50,12 +51,6 @@ export interface RunAgentResult {
 // System prompt
 // ---------------------------------------------------------------------------
 
-interface RosterMember {
-  id: string;
-  name: string;
-  aliases: string[];
-}
-
 async function getFamilyRoster(): Promise<RosterMember[]> {
   try {
     const db = getDb();
@@ -78,9 +73,8 @@ function formatRoster(roster: RosterMember[]): string {
     .join("\n");
 }
 
-async function buildSystemPrompt(source: AgentSource): Promise<string> {
+function buildSystemPrompt(source: AgentSource, roster: RosterMember[]): string {
   const tz = getFamilyTimeZone();
-  const roster = await getFamilyRoster();
 
   return `You are LuthCal, the scheduling assistant for the Luthra family. You normally live in their iMessage group chat${
     source === "dashboard" ? ", but this particular message came from the family's web dashboard, not the group chat" : ""
@@ -92,12 +86,13 @@ Family roster:
 ${formatRoster(roster)}
 
 How to operate:
-1. Parse who the event is for, what it is, and when. Match names against the roster above (including aliases) rather than guessing at a new person.
-2. If the family member or the time is genuinely ambiguous (e.g. two people could plausibly be meant, or a date phrase has two reasonable readings), ask a short clarifying question instead of guessing. Don't ask about things that are reasonably inferable — pick something sensible for an unstated detail (like a default evening time for "dinner") and say what you picked.
-3. After creating or moving an event that has assigned family members, always call checkConflicts for that event's members and time range, and mention any conflicts in your reply, prefixed with a warning emoji (⚠️).
-4. Use listEvents to find an event's googleEventId (e.g. from context earlier in the conversation, or by asking what it's called and searching a reasonable window) before calling updateEvent or deleteEvent.
-5. Keep replies short and warm — they're going into a family group text, not a confirmation email. One or two sentences is usually enough.
-6. Only use sendGroupMessage for a message beyond your normal reply — your normal reply already reaches the chat, so don't send it twice.`;
+1. Parse who the event is for, what it is, and when. When calling createEvent/updateEvent, pass memberNames as the name/alias text you read in the conversation (e.g. "Maya", "mom") — do NOT resolve those names to ids yourself; that's done deterministically, outside your control, against the roster above. The read-only tools are the one exception: checkConflicts and listEvents take member *ids*, not names — use the \`id:\` values shown in the roster above for those.
+2. If createEvent/updateEvent returns an ambiguousMember result instead of a created/updated event, the name you gave matched more than one family member (listed in candidates). Do not retry with a guess — ask the user which person they meant, then call the tool again once they've told you. If instead it returns unresolvedMemberNames alongside a created/updated event, those names matched nobody on the roster and were left off the event — briefly note that in your reply (e.g. "I didn't recognize 'Emma' as a family member, so I didn't tag anyone") so a typo or a missing roster entry gets caught, but don't block on it.
+3. If the family member or the time is genuinely ambiguous in the conversation itself (e.g. a date phrase has two reasonable readings), ask a short clarifying question instead of guessing. Don't ask about things that are reasonably inferable — pick something sensible for an unstated detail (like a default evening time for "dinner") and say what you picked.
+4. After creating or moving an event that has assigned family members, always call checkConflicts for that event's members and time range, and mention any conflicts in your reply, prefixed with a warning emoji (⚠️).
+5. Use listEvents to find an event's googleEventId (e.g. from context earlier in the conversation, or by asking what it's called and searching a reasonable window) before calling updateEvent or deleteEvent.
+6. Keep replies short and warm — they're going into a family group text, not a confirmation email. One or two sentences is usually enough.
+7. Only use sendGroupMessage for a message beyond your normal reply — your normal reply already reaches the chat, so don't send it twice.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +179,14 @@ export async function runAgent({ messages, source, chatGuid, senderHandle }: Run
     await logMessage("inbound", { chatGuid, senderHandle, text: lastUserMessage.content });
   }
 
-  const system = await buildSystemPrompt(source);
-  const tools = buildAgentTools({ source, chatGuid });
+  // Fetched once and reused for both the prompt and the tools, so
+  // createEvent/updateEvent's memberNames resolution (see
+  // lib/agent/tools.ts resolveMemberNames) is guaranteed to run against the
+  // exact same roster snapshot the model was shown, not a second query that
+  // could race a concurrent roster edit.
+  const roster = await getFamilyRoster();
+  const system = buildSystemPrompt(source, roster);
+  const tools = buildAgentTools({ source, chatGuid, roster });
 
   const modelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
     m.role === "user" ? { role: "user", content: m.content } : { role: "assistant", content: m.content },
