@@ -84,12 +84,23 @@ export type SendResult =
   | { ok: true; guid: string }
   | { ok: false; status: number; error: string; retryable: boolean };
 
+// F1 (tech-lead follow-up): the fetch below previously had no timeout, so a
+// dead tunnel / black-holed connection to the Mac could hang for the entire
+// remaining function budget, starving every other row still waiting in the
+// same outbound-processor batch. AbortSignal.timeout below bounds a single
+// send attempt; the resulting AbortError is caught by the existing
+// network-failure branch and returned as a normal, retryable SendResult —
+// never thrown up to abort the batch.
+const SEND_TIMEOUT_MS = 10_000;
+
 /**
  * Sends a text message to an iMessage chat via the BlueBubbles REST API.
  * Returns a discriminated result rather than throwing on a failed send — the
  * outbound queue processor (lib/outbound-processor.ts) decides retry vs.
  * give-up based on `retryable`, and a "the Mac is asleep" failure here is an
- * expected, routine condition, not an exceptional one.
+ * expected, routine condition, not an exceptional one. A request that hangs
+ * past `SEND_TIMEOUT_MS` (dead tunnel, black-holed connection) is treated the
+ * same way — see the note above.
  *
  * Throws only for a genuine misconfiguration (BLUEBUBBLES_URL/PASSWORD
  * unset) — that's a setup bug, not a transient send failure, so it's
@@ -113,11 +124,12 @@ export async function sendGroupMessage(chatGuid: string, text: string): Promise<
         message: text,
         method,
       }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
   } catch (err) {
-    // Network-level failure — DNS, connection refused, timeout. This is
-    // exactly the "Mac is asleep / tunnel is down" case the outbound_queue
-    // exists for: always retryable.
+    // Network-level failure — DNS, connection refused, timeout, or the
+    // SEND_TIMEOUT_MS abort firing. This is exactly the "Mac is asleep /
+    // tunnel is down" case the outbound_queue exists for: always retryable.
     return {
       ok: false,
       status: 0,

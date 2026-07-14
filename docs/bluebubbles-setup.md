@@ -113,7 +113,8 @@ In the LuthCal Vercel project (`vercel env add ...` or the dashboard):
 | `BLUEBUBBLES_WEBHOOK_SECRET` | A long random string you generate (e.g. `openssl rand -hex 32`) — guards the inbound webhook, see §6 |
 | `BLUEBUBBLES_SEND_METHOD` | `apple-script` (default) or `private-api` — see §8 |
 | `FAMILY_CHAT_GUID` | The group chat's GUID — see §7 |
-| `CRON_SECRET` | A long random string — guards every `/api/cron/*` endpoint (see vercel.json) |
+| `AGENT_IMESSAGE_HANDLE` | The dedicated Apple ID from §1 (the same email/phone signed into Messages.app on the bridge Mac) — a defense-in-depth loop guard, see §6 |
+| `CRON_SECRET` | A long random string — guards every `/api/cron/*` endpoint (see vercel.json). Also used by the external GitHub Actions cron pinger — see docs/cron-pinger.md |
 
 ## 6. Register the webhook
 
@@ -144,6 +145,35 @@ The webhook ignores every event except `new-message` (and the URL-change
 event above), and ignores `new-message` events where `isFromMe` is true —
 that's the agent's own outbound texts echoing back through the bridge, and
 replying to those would make the agent talk to itself forever.
+
+**Confirm the `isFromMe` field name during setup.** That field name is
+inferred from third-party BlueBubbles integration examples, not
+independently verified against a live server's actual webhook payload (see
+the comment above `SERVER_URL_CHANGE_TYPES` in
+`app/api/webhooks/bluebubbles/route.ts`). If it's wrong, the loop guard
+fails *open* — the agent would reply to its own messages forever. Once the
+webhook is registered, send one test message to the group chat from a
+**real family member's** phone (not the agent's Apple ID) and check the
+Vercel function logs (or add a temporary `console.log(JSON.stringify(payload))`
+at the top of the `POST` handler) for the raw `new-message` payload shape,
+then send one **from the agent's own dedicated Apple ID** (§1) and confirm
+`data.isFromMe` is actually `true` on that one. As a second, independent
+safety net against exactly this kind of drift, the webhook also checks the
+sender handle against `AGENT_IMESSAGE_HANDLE` (case-insensitive) and drops
+the message either way — set that env var (see §5) so the loop guard isn't
+relying on `isFromMe` alone.
+
+**Bootstrap the Google Calendar watch channel right after first deploy.**
+`app/api/cron/renew-watch` only runs once daily on Vercel Cron (~3:30-4:30am
+FAMILY_TZ, off-peak — see the schedule table below), so a fresh deployment
+with no watch channel registered yet would otherwise wait up to ~24h before
+calendar-app-added events start syncing into `event_meta` (and therefore
+get announced — see docs/agent-core.md §3). Hit it once manually right
+after the first deploy to register the channel immediately instead of
+waiting for the first scheduled tick:
+```
+curl "https://<your-luthcal-deployment>.vercel.app/api/cron/renew-watch?secret=<CRON_SECRET>"
+```
 
 ## 7. Finding `FAMILY_CHAT_GUID`
 
@@ -232,6 +262,15 @@ between operational simplicity and DST correctness.
 
 **Frequency note:** sub-daily schedules (reminders, announce, outbound retry
 — all every 5–15 minutes) require a **Vercel Pro plan or higher**; the
-Hobby plan restricts cron jobs to once per day. This is a real operational
-decision, not just a config detail — flagged for tech-lead in the build
-report.
+Hobby plan restricts cron jobs to once per day, and silently downgrades
+these `vercel.json` entries to that once-daily cadence rather than erroring
+at deploy time. The `vercel.json` schedules above are left declared as-is
+(they become fully correct with zero changes if the family upgrades to
+Pro), but as long as the family stays on Hobby, these three sub-daily jobs
+are actually driven by an **external GitHub Actions cron pinger**
+(`.github/workflows/cron-pinger.yml`) instead — see **docs/cron-pinger.md**
+for the full setup (required repo secrets, chosen cadence, and the
+overlap-safety changes that make pinging these endpoints from two clocks at
+once — GitHub's and Vercel's — safe). The daily/weekly digest and the
+once-daily watch-channel renewal don't need this workaround; Hobby's
+native once-a-day cron already covers them.

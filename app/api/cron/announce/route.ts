@@ -1,5 +1,9 @@
+import { and, eq, isNull } from "drizzle-orm";
+
 import { enqueueOutbound } from "@/lib/agent/outbound";
-import { getEvent, listPendingAnnouncements, markAnnounced } from "@/lib/google/events";
+import { getDb } from "@/lib/db";
+import { eventMeta } from "@/lib/db/schema";
+import { getEvent, listPendingAnnouncements } from "@/lib/google/events";
 import { getFamilyTimeZone } from "@/lib/google/time";
 import { formatEventLine, getMemberNameMap } from "@/lib/message-format";
 import { isValidCronRequest } from "@/lib/webhook-auth";
@@ -14,6 +18,33 @@ function requireFamilyChatGuid(): string {
   const guid = process.env.FAMILY_CHAT_GUID;
   if (!guid) throw new Error("FAMILY_CHAT_GUID is not set");
   return guid;
+}
+
+// F2 (tech-lead follow-up): this endpoint is externally pingable (see
+// .github/workflows/cron-pinger.yml), so two overlapping sweeps are a real
+// possibility. `event_meta` has no separate 'sending' status column like
+// outbound_queue (announced_at is a nullable timestamp, not a status enum —
+// changing that shape is lib/google/events.ts's territory, out of bounds
+// here), so the claim is a per-row conditional UPDATE instead of the
+// set-based claim used in lib/outbound-processor.ts: flip announced_at from
+// NULL to now() *before* enqueuing, and only proceed if this call actually
+// won that race (`.returning()` comes back empty if another concurrent
+// sweep already claimed the row). If the enqueue itself then fails, the
+// claim is rolled back (announced_at reset to NULL) so a later sweep
+// retries it instead of silently losing the announcement.
+async function tryClaimAnnouncement(googleEventId: string): Promise<boolean> {
+  const db = getDb();
+  const claimed = await db
+    .update(eventMeta)
+    .set({ announcedAt: new Date() })
+    .where(and(eq(eventMeta.googleEventId, googleEventId), isNull(eventMeta.announcedAt)))
+    .returning({ googleEventId: eventMeta.googleEventId });
+  return claimed.length > 0;
+}
+
+async function releaseAnnouncementClaim(googleEventId: string): Promise<void> {
+  const db = getDb();
+  await db.update(eventMeta).set({ announcedAt: null }).where(eq(eventMeta.googleEventId, googleEventId));
 }
 
 export async function GET(request: Request) {
@@ -33,19 +64,31 @@ export async function GET(request: Request) {
     const names = await getMemberNameMap();
     let announced = 0;
     for (const item of pending) {
-      const event = await getEvent(item.googleEventId);
-      if (!event) {
-        // The event was deleted between being flagged pending and now (or
-        // the id is stale) — nothing left to announce. Mark it anyway so a
-        // dead id doesn't sit in the pending queue forever.
-        await markAnnounced(item.googleEventId);
-        continue;
-      }
+      // Claim-before-send: skip this row entirely if another overlapping
+      // sweep already claimed it since listPendingAnnouncements() ran.
+      const claimed = await tryClaimAnnouncement(item.googleEventId);
+      if (!claimed) continue;
 
-      const verb = event.createdVia === "calendar_app" ? "New on the calendar" : "Added";
-      await enqueueOutbound(chatGuid, `${verb}: ${formatEventLine(event, tz, names)}`);
-      await markAnnounced(item.googleEventId);
-      announced++;
+      try {
+        const event = await getEvent(item.googleEventId);
+        if (!event) {
+          // The event was deleted between being flagged pending and now (or
+          // the id is stale) — nothing left to announce. The claim above
+          // already marks it announced, so a dead id doesn't sit in the
+          // pending queue forever.
+          continue;
+        }
+
+        const verb = event.createdVia === "calendar_app" ? "New on the calendar" : "Added";
+        await enqueueOutbound(chatGuid, `${verb}: ${formatEventLine(event, tz, names)}`);
+        announced++;
+      } catch (err) {
+        // The claim succeeded but the fetch/enqueue after it failed — undo
+        // the claim so a future sweep retries this event instead of it
+        // silently never being announced.
+        await releaseAnnouncementClaim(item.googleEventId);
+        console.error("[api/cron/announce] failed to announce", item.googleEventId, err);
+      }
     }
 
     return Response.json({ announced });

@@ -1,0 +1,92 @@
+name: Cron pinger
+
+# LuthCal is on Vercel Hobby, which caps Vercel Cron at 1 invocation/day per
+# job (see vercel.json + docs/bluebubbles-setup.md "Frequency note"). The
+# reminder sweep, announce sweep, and outbound-queue retry all need to run
+# every 5-15 minutes to be useful, so this workflow pings their cron
+# endpoints on GitHub Actions' scheduler instead. Full rationale, cadence,
+# and the Hobby-vs-Pro tradeoff are documented in docs/cron-pinger.md.
+#
+# The daily/weekly digest and the once-daily watch-channel renewal are left
+# to Vercel's own cron (vercel.json) — they only need to fire once a day,
+# which Hobby supports natively, so pinging them here too would be
+# redundant. See docs/cron-pinger.md for the reasoning.
+#
+# GitHub Actions `schedule:` triggers are best-effort, not exact — GitHub
+# explicitly documents that scheduled runs can be delayed (more so during
+# periods of high load) and have a practical minimum granularity around 5
+# minutes. This is an accepted tradeoff of the external-pinger strategy, not
+# a bug: a reminder or announcement landing a few minutes late is fine for a
+# family calendar.
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   APP_BASE_URL  - the deployed app's public https URL, e.g.
+#                   https://luthcal.vercel.app (no trailing slash)
+#   CRON_SECRET   - same value as the Vercel env var of the same name; sent
+#                   as `Authorization: Bearer <CRON_SECRET>`, exactly what
+#                   Vercel Cron itself sends (see lib/webhook-auth.ts
+#                   isValidCronRequest)
+
+on:
+  schedule:
+    # Every 10 minutes, all day. Comfortably above GitHub's ~5 min floor and
+    # inside both the reminders/announce cadence (*/15 in vercel.json's own
+    # schedule) and the outbound retry cadence (*/5) documented for Vercel
+    # Cron — see docs/cron-pinger.md for why 10 min was chosen as the single
+    # shared cadence for all three sub-daily endpoints on Hobby.
+    - cron: "*/10 * * * *"
+  # Lets a maintainer trigger a manual run from the Actions tab — e.g. to
+  # confirm APP_BASE_URL/CRON_SECRET are configured right after first
+  # setting up the repo secrets, without waiting for the next scheduled tick.
+  workflow_dispatch:
+
+concurrency:
+  # Never let two ticks of this workflow overlap. The cron endpoints
+  # themselves are now safe under overlapping calls too (see the
+  # claim-before-send fixes in lib/outbound-processor.ts and
+  # app/api/cron/announce/route.ts), but there's no reason to invite the
+  # race in the first place when GitHub Actions' own scheduler can just
+  # skip a run that's still in flight.
+  group: cron-pinger
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: ping sub-daily cron endpoints
+    runs-on: ubuntu-latest
+    env:
+      APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+    steps:
+      - name: Ping reminders, announce, and outbound-queue retry
+        run: |
+          set -u
+
+          if [ -z "${APP_BASE_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::APP_BASE_URL and/or CRON_SECRET repo secrets are not set — see docs/cron-pinger.md"
+            exit 1
+          fi
+
+          base="${APP_BASE_URL%/}"
+          overall_status=0
+
+          for path in "/api/cron/reminders" "/api/cron/announce" "/api/cron/outbound"; do
+            url="${base}${path}"
+            echo "Pinging ${path} ..."
+
+            http_code=$(curl -sS -o /tmp/cron-pinger-body.txt -w "%{http_code}" \
+              --max-time 30 \
+              -H "Authorization: Bearer ${CRON_SECRET}" \
+              "${url}") || http_code="000"
+
+            body=$(cat /tmp/cron-pinger-body.txt 2>/dev/null || true)
+
+            if [ "${http_code}" -ge 200 ] && [ "${http_code}" -lt 300 ]; then
+              echo "  ok (${http_code}): ${body}"
+            else
+              echo "::error::${path} returned non-2xx status ${http_code}: ${body}"
+              overall_status=1
+            fi
+          done
+
+          exit "${overall_status}"

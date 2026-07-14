@@ -37,7 +37,13 @@ export const outboundQueue = pgTable("outbound_queue", {
   id: uuid("id").primaryKey().defaultRandom(),
   chatGuid: text("chat_guid").notNull(),
   text: text("text").notNull(),
-  status: text("status", { enum: ["pending", "sent", "failed"] })
+  // "sending" is a transient claim state (see lib/outbound-processor.ts):
+  // a row is atomically moved pending -> sending before a send attempt so
+  // two overlapping sweeps (the endpoints are externally pingable — see
+  // .github/workflows/cron-pinger.yml) can't both claim and double-send the
+  // same row. Migration-safe: existing rows are all 'pending'/'sent'/'failed'
+  // already, and the column default is unchanged.
+  status: text("status", { enum: ["pending", "sending", "sent", "failed"] })
     .notNull()
     .default("pending"),
   attempts: integer("attempts").notNull().default(0),
@@ -46,6 +52,15 @@ export const outboundQueue = pgTable("outbound_queue", {
     .notNull()
     .defaultNow(),
   sentAt: timestamp("sent_at", { withTimezone: true }),
+  // F1 (tech-lead follow-up): set at the moment a row is atomically claimed
+  // pending -> sending (see lib/outbound-processor.ts), cleared back to null
+  // whenever a row leaves 'sending' (sent, failed, or reaped back to
+  // pending). Lets the reaper distinguish "claimed a moment ago, still being
+  // processed by a live sweep" from "claimed by a sweep that crashed/timed
+  // out and never came back" without a blanket sending -> pending reset.
+  // Nullable, no default: migration-safe the same way the 'sending' enum
+  // value was — existing rows are unaffected.
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
 });
 
 export const messageLog = pgTable("message_log", {
