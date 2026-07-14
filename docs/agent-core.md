@@ -168,10 +168,11 @@ overlap = candidate.start < other.end && candidate.end > other.start
 - Restricted to events that share **at least one** `family_members.id` with
   the candidate (an overlap between two events for different people isn't a
   conflict).
-- **All-day events are ignored unless the candidate is itself all-day.** An
-  all-day "reminder"-style event (e.g. "Kai's spring break") shouldn't flag a
-  conflict against every timed event that week; two all-day events on the
-  same day *do* conflict with each other.
+- **A pair conflicts only when both are timed, or both are all-day** (tech-lead's
+  canonical ruling; `if (event.allDay !== candidate.allDay) continue`). An
+  all-day "reminder"-style event (e.g. "Kai's spring break") never flags a
+  conflict against a timed event that week, in either direction — but two
+  overlapping all-day events on the same day *do* conflict with each other.
 - `excludeGoogleEventId` lets an update check conflicts without the event
   matching itself.
 - The query window is widened by 24h on each side of the candidate range
@@ -188,17 +189,11 @@ per-member personal-calendar awareness (would need either calendar
 free/busy queries against each member's personal calendar, or a
 member-specific OAuth grant — a materially bigger change).
 
-**Cross-team inconsistency to flag for tech-lead:** the dashboard's mock
-conflict logic (`lib/mock/conflicts.ts`, frontend-design's file) uses a
-*stricter* all-day rule — `if (a.allDay || b.allDay) return false`, i.e. an
-all-day event never conflicts with anything, including another all-day
-event. This real backend's rule (all-day only excluded when the *candidate*
-isn't also all-day) is what the original task brief specified verbatim, so
-that's what got built here, but the two rules disagree on the
-all-day-vs-all-day case. When the dashboard's mock adapter is swapped for
-the real one, conflict highlighting will change behavior for that case
-unless one side is brought in line with the other — a decision for
-tech-lead, not made unilaterally in either module.
+**Cross-team consistency (resolved).** The dashboard's mock conflict logic
+(`lib/mock/conflicts.ts`) was brought in line with this same canonical rule
+(`if (a.allDay !== b.allDay) return false`), so the mock and the real backend
+now agree on every case including all-day-vs-all-day. Swapping the mock adapter
+for the real one won't change conflict-highlighting behavior.
 
 ## 5. Data model
 

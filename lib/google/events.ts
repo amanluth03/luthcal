@@ -213,6 +213,10 @@ export async function updateEvent(input: UpdateEventInput): Promise<LuthEvent> {
   if (input.memberIds !== undefined) {
     await safeDb("event_meta memberIds sync", async () => {
       const db = getDb();
+      // TODO(Finding 4, low-pri): createdVia here is a guess for the
+      // no-existing-row case (we don't actually know how this event was
+      // created); onConflictDoUpdate below never overwrites createdVia on an
+      // existing row, so this guess only ever affects a freshly-inserted row.
       await db
         .insert(eventMeta)
         .values({ googleEventId: normalized.id, memberIds: input.memberIds!, createdVia: "calendar_app" })
@@ -290,6 +294,7 @@ export async function markAnnounced(googleEventId: string): Promise<void> {
  * v1 sends at most one reminder per event — see docs/agent-core.md.
  */
 export async function listUpcomingEventsPendingReminder(withinMs: number): Promise<LuthEvent[]> {
+  const tz = getFamilyTimeZone();
   const now = new Date();
   const events = await listEvents({
     startISO: now.toISOString(),
@@ -297,14 +302,41 @@ export async function listUpcomingEventsPendingReminder(withinMs: number): Promi
   });
   if (events.length === 0) return [];
 
+  // Google's timeMin/timeMax (via listEvents above) returns anything that
+  // OVERLAPS the window, including events already in progress — a multi-day
+  // all-day trip that started yesterday, a long timed event that began an
+  // hour ago. The contract here is "events STARTING within withinMs," so
+  // filter down to that by actual start instant.
+  //
+  // All-day events don't have a real start *instant* to compare against a
+  // short rolling window: LuthEvent.start is midnight in FAMILY_TZ on the
+  // event's start date (see calendarDateToISO), which has already passed by
+  // `now` for essentially the entire day the event starts — a literal
+  // instant check would almost never fire for an all-day event. Judgment
+  // call (tech-lead's intent is "starting soon"): treat an all-day event as
+  // "starting soon" if its start date, in FAMILY_TZ, is *today*, regardless
+  // of what time of day this sweep happens to run. This still correctly
+  // excludes an all-day event already in progress (its start date is before
+  // today), which is the bug this fix targets — it just doesn't require the
+  // sweep to catch it in the narrow instant right after midnight.
+  const nowMs = now.getTime();
+  const windowEndMs = nowMs + withinMs;
+  const today = toCalendarDate(now.toISOString(), tz);
+  const upcoming = events.filter((e) => {
+    if (e.allDay) return toCalendarDate(e.start, tz) === today;
+    const startMs = new Date(e.start).getTime();
+    return startMs >= nowMs && startMs <= windowEndMs;
+  });
+  if (upcoming.length === 0) return [];
+
   const db = getDb();
   const rows = await db
     .select({ googleEventId: eventMeta.googleEventId, remindedAt: eventMeta.remindedAt })
     .from(eventMeta)
-    .where(inArray(eventMeta.googleEventId, events.map((e) => e.id)));
+    .where(inArray(eventMeta.googleEventId, upcoming.map((e) => e.id)));
 
   const alreadyReminded = new Set(rows.filter((r) => r.remindedAt !== null).map((r) => r.googleEventId));
-  return events.filter((e) => !alreadyReminded.has(e.id));
+  return upcoming.filter((e) => !alreadyReminded.has(e.id));
 }
 
 export async function markReminded(googleEventId: string): Promise<void> {

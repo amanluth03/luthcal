@@ -24,10 +24,14 @@ export interface ConflictMatch {
  *
  *   overlap = candidate.start < other.end && candidate.end > other.start
  *
- * ...restricted to events that share at least one family member, and with
- * all-day events ignored unless the candidate itself is all-day (an all-day
- * "reminder" event shouldn't flag a conflict against every timed event that
- * day; two all-day events on the same day *do* conflict).
+ * ...restricted to events that share at least one family member, and to
+ * pairs of the *same kind*: a timed event only conflicts with another timed
+ * event, and an all-day event only conflicts with another all-day event. An
+ * all-day event never conflicts with a timed event, in either direction (an
+ * all-day "reminder" event like "Kai's spring break" shouldn't flag a
+ * conflict against every timed event that week, and a timed event shouldn't
+ * flag against every all-day event covering that day either); two all-day
+ * events on the same day *do* conflict with each other.
  *
  * Shared-calendar-only: this only sees events on the family's single shared
  * calendar. A member's personal calendar (if they keep one) is invisible to
@@ -50,7 +54,9 @@ export async function checkConflicts(input: CheckConflictsInput): Promise<Confli
   const matches: ConflictMatch[] = [];
   for (const event of events) {
     if (input.excludeGoogleEventId && event.id === input.excludeGoogleEventId) continue;
-    if (event.allDay && !candidateAllDay) continue;
+    // Both-timed or both-all-day only — see the canonical rule in the
+    // docstring above. An all-day event never conflicts with a timed event.
+    if (event.allDay !== candidateAllDay) continue;
 
     const sharedMembers = event.memberIds.filter((id) => input.memberIds.includes(id));
     if (sharedMembers.length === 0) continue;

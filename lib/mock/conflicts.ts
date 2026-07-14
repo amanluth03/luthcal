@@ -1,11 +1,13 @@
 import type { LuthEvent } from "./types";
 
 /** Two events conflict when they share at least one family member and their
- * time ranges overlap. All-day events are excluded from conflict detection —
- * a work trip and a dentist appointment on the same day isn't a "conflict"
- * the way two overlapping timed events are. */
+ * time ranges overlap. Canonical rule (mirrors lib/google/conflicts.ts): a
+ * pair conflicts only when both are timed, or both are all-day — an all-day
+ * event never conflicts with a timed one in either direction (a work trip and
+ * a dentist appointment on the same day isn't a "conflict" the way two
+ * overlapping timed events are), but two overlapping all-day events do. */
 function overlaps(a: LuthEvent, b: LuthEvent): boolean {
-  if (a.allDay || b.allDay) return false;
+  if (a.allDay !== b.allDay) return false;
   const aStart = Date.parse(a.start);
   const aEnd = Date.parse(a.end);
   const bStart = Date.parse(b.start);

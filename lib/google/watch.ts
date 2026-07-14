@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { calendar_v3 } from "googleapis";
 
@@ -40,7 +40,16 @@ function getChannelToken(): string {
 export function isValidChannelToken(token: string | null | undefined): boolean {
   if (!token) return false;
   const secret = process.env.CRON_SECRET;
-  return Boolean(secret) && token === secret;
+  if (!secret) return false; // fail closed — an unset secret must never validate
+
+  // Constant-time compare (crypto.timingSafeEqual requires equal-length
+  // buffers, so a length mismatch is checked — and fails closed — first;
+  // that length check is not itself timing-sensitive, since string length
+  // isn't secret).
+  const tokenBuf = Buffer.from(token);
+  const secretBuf = Buffer.from(secret);
+  if (tokenBuf.length !== secretBuf.length) return false;
+  return timingSafeEqual(tokenBuf, secretBuf);
 }
 
 function getWebhookAddress(): string {
@@ -141,7 +150,13 @@ function isSyncTokenExpiredError(err: unknown): boolean {
   return status === 410;
 }
 
-async function upsertEventMetaFromGoogleEvent(event: calendar_v3.Schema$Event): Promise<void> {
+/**
+ * @param isBackfill True when this event was discovered by a seed/backfill
+ * sync (no syncToken — either the very first sync after channel
+ * registration, or a post-410 resync), as opposed to a genuine incremental
+ * syncToken diff. Only matters for the "never seen before" insert path below.
+ */
+async function upsertEventMetaFromGoogleEvent(event: calendar_v3.Schema$Event, isBackfill: boolean): Promise<void> {
   if (!event.id) return;
   const db = getDb();
 
@@ -175,16 +190,25 @@ async function upsertEventMetaFromGoogleEvent(event: calendar_v3.Schema$Event): 
     return;
   }
 
-  // First time we're seeing this Google event. If it carries no luthcal tag,
-  // a family member added it directly in a calendar app — flag it for
-  // announcement (announced_at null). If it does carry a tag but has no
-  // event_meta row (e.g. the row was lost), back-fill one, still flagged for
-  // announcement since we can't prove it was already announced.
+  // First time we're seeing this Google event.
+  //
+  // - Genuine incremental diff (isBackfill === false, a real syncToken was
+  //   used for this sync): this event is newly created/changed since our
+  //   last known state — if it carries no luthcal tag, a family member added
+  //   it directly in a calendar app; if it does carry a tag but has no
+  //   event_meta row (e.g. the row was lost), back-fill one. Either way,
+  //   flag it for announcement (announced_at null).
+  // - Seed/backfill sync (isBackfill === true: the first sync after channel
+  //   registration, or a post-410 resync — both have no syncToken to diff
+  //   against): every pre-existing event on the calendar shows up here, not
+  //   just newly-added ones. Treat these as already-known (announced_at
+  //   now()) so the announce sweep doesn't flood the chat with the family's
+  //   entire recent calendar the first time it runs. See docs/agent-core.md.
   await db.insert(eventMeta).values({
     googleEventId: event.id,
     memberIds,
     createdVia: createdViaRaw ?? "calendar_app",
-    announcedAt: null,
+    announcedAt: isBackfill ? new Date() : null,
   });
 }
 
@@ -226,6 +250,12 @@ async function runSync(
   let nextSyncToken: string | undefined;
   let processed = 0;
 
+  // Whether this call is a seed/backfill (no syncToken to diff against) as
+  // opposed to a genuine incremental sync. Computed once per call, not
+  // per-page — a paginated continuation (pageToken) is still part of the
+  // same logical sync as its first page.
+  const isBackfill = !state?.syncToken;
+
   do {
     const res = await calendar.events.list({
       calendarId,
@@ -241,7 +271,7 @@ async function runSync(
     });
 
     for (const event of res.data.items ?? []) {
-      await upsertEventMetaFromGoogleEvent(event);
+      await upsertEventMetaFromGoogleEvent(event, isBackfill);
       processed++;
     }
 
