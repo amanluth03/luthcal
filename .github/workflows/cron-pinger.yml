@@ -63,8 +63,13 @@ jobs:
           set -u
 
           if [ -z "${APP_BASE_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
-            echo "::error::APP_BASE_URL and/or CRON_SECRET repo secrets are not set — see docs/cron-pinger.md"
-            exit 1
+            # Not configured yet (expected until the app is deployed and the
+            # APP_BASE_URL/CRON_SECRET repo secrets are set). Skip quietly and
+            # succeed — there is nothing to ping, and a failing scheduled run
+            # here would just email the repo owner every tick. Once the secrets
+            # are set, this guard is skipped and real ping failures fail loudly.
+            echo "::notice::APP_BASE_URL/CRON_SECRET not set yet — skipping ping (see docs/cron-pinger.md)"
+            exit 0
           fi
 
           base="${APP_BASE_URL%/}"
