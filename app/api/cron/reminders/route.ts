@@ -35,10 +35,11 @@ import { isValidCronRequest } from "@/lib/webhook-auth";
 const DEFAULT_REMINDER_LEAD_MS = 2 * 60 * 60 * 1000; // 2h, per the task brief's default
 const REMINDER_LEAD_SETTINGS_KEY = "reminder_lead_ms";
 
-function requireFamilyChatGuid(): string {
-  const guid = process.env.FAMILY_CHAT_GUID;
-  if (!guid) throw new Error("FAMILY_CHAT_GUID is not set");
-  return guid;
+// Returns the family chat GUID, or null if the iMessage bridge isn't
+// configured yet. The sweep treats null as "nowhere to deliver" and skips
+// gracefully (200) rather than failing — see the call site.
+function getFamilyChatGuid(): string | null {
+  return process.env.FAMILY_CHAT_GUID || null;
 }
 
 /** Claims a reminder for `googleEventId` by flipping reminded_at NULL -> now() iff it's still NULL. Returns whether this call won the claim (false means another sweep already has it). */
@@ -81,7 +82,12 @@ export async function GET(request: Request) {
 
   try {
     const tz = getFamilyTimeZone();
-    const chatGuid = requireFamilyChatGuid();
+    const chatGuid = getFamilyChatGuid();
+    if (!chatGuid) {
+      // No iMessage bridge configured yet — nowhere to deliver reminders.
+      // Skip successfully instead of failing the sweep (and the pinger).
+      return Response.json({ skipped: "FAMILY_CHAT_GUID not set", reminded: 0 });
+    }
     const leadMs = await getReminderLeadMs();
     const events = await listUpcomingEventsPendingReminder(leadMs);
 

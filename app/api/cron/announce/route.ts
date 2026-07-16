@@ -14,10 +14,11 @@ import { isValidCronRequest } from "@/lib/webhook-auth";
 // docs/agent-core.md §3 "Announcements"). This sweep picks up everything
 // with event_meta.announced_at still null, formats it, and delivers it.
 
-function requireFamilyChatGuid(): string {
-  const guid = process.env.FAMILY_CHAT_GUID;
-  if (!guid) throw new Error("FAMILY_CHAT_GUID is not set");
-  return guid;
+// Returns the family chat GUID, or null if the iMessage bridge isn't
+// configured yet. Sweeps treat null as "nowhere to deliver" and skip
+// gracefully (200) rather than failing — see the call site.
+function getFamilyChatGuid(): string | null {
+  return process.env.FAMILY_CHAT_GUID || null;
 }
 
 // F2 (tech-lead follow-up): this endpoint is externally pingable (see
@@ -54,7 +55,12 @@ export async function GET(request: Request) {
 
   try {
     const tz = getFamilyTimeZone();
-    const chatGuid = requireFamilyChatGuid();
+    const chatGuid = getFamilyChatGuid();
+    if (!chatGuid) {
+      // No iMessage bridge configured yet — nowhere to deliver announcements.
+      // Skip successfully instead of failing the sweep (and the pinger).
+      return Response.json({ skipped: "FAMILY_CHAT_GUID not set", announced: 0 });
+    }
     const pending = await listPendingAnnouncements();
 
     if (pending.length === 0) {

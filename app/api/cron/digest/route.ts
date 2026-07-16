@@ -21,10 +21,11 @@ type DigestKind = "daily" | "weekly";
 const DAILY_SETTINGS_KEY = "last_daily_digest_sent";
 const WEEKLY_SETTINGS_KEY = "last_weekly_digest_sent";
 
-function requireFamilyChatGuid(): string {
-  const guid = process.env.FAMILY_CHAT_GUID;
-  if (!guid) throw new Error("FAMILY_CHAT_GUID is not set");
-  return guid;
+// Returns the family chat GUID, or null if the iMessage bridge isn't
+// configured yet. The digest treats null as "nowhere to deliver" and skips
+// gracefully (200) rather than failing — see the call site.
+function getFamilyChatGuid(): string | null {
+  return process.env.FAMILY_CHAT_GUID || null;
 }
 
 async function getLastSent(key: string): Promise<string | undefined> {
@@ -132,12 +133,18 @@ export async function GET(request: Request) {
   const dedupKey = kind === "daily" ? DAILY_SETTINGS_KEY : WEEKLY_SETTINGS_KEY;
 
   try {
+    const chatGuid = getFamilyChatGuid();
+    if (!chatGuid) {
+      // No iMessage bridge configured yet — nowhere to deliver the digest.
+      // Skip successfully (and don't mark it sent) instead of failing.
+      return Response.json({ kind, skipped: true, reason: "FAMILY_CHAT_GUID not set" });
+    }
+
     const lastSent = await getLastSent(dedupKey);
     if (lastSent === todayKey) {
       return Response.json({ kind, skipped: true, reason: "already sent for this date" });
     }
 
-    const chatGuid = requireFamilyChatGuid();
     const names = await getMemberNameMap();
     const text = kind === "daily" ? await buildDailyDigestText(tz, names) : await buildWeeklyDigestText(tz, names);
 
