@@ -7,10 +7,13 @@ import type { RosterMember } from "./match-member";
  *
  * `senderHandle` is an iMessage handle (phone number or Apple ID email) for
  * `source: "imessage"`, or the signed-in dashboard user's Google account
- * email for `source: "dashboard"` (see app/api/chat/route.ts) — both are
- * matched the same way here, against `family_members.imessageHandle` (which
- * doubles as an email/Apple-ID field — see scripts/seed.ts, where Aman's row
- * stores his Gmail address there) or `family_members.phone`.
+ * email for `source: "dashboard"` (see app/api/chat/route.ts) — matched
+ * here against ALL of a member's known identifiers:
+ * `family_members.imessageHandle`, `.phone`, and every entry in
+ * `.identifiers` (the general-purpose "every handle this person is known
+ * by" column — see docs/agent-core.md "Identifier consolidation" and
+ * scripts/seed.ts, which seeds each family member's Google/dashboard email
+ * there).
  *
  * This is a DIFFERENT lookup from lib/agent/match-member.ts's `matchMember`:
  * that resolves a name mentioned *in* a message's text ("create an event for
@@ -29,7 +32,8 @@ export function resolveSenderMemberId(senderHandle: string | undefined, roster: 
   const match = roster.find((member) => {
     const imessageHandle = member.imessageHandle?.trim().toLowerCase();
     const phone = member.phone?.trim().toLowerCase();
-    return imessageHandle === handle || phone === handle;
+    const identifiers = (member.identifiers ?? []).map((id) => id.trim().toLowerCase());
+    return imessageHandle === handle || phone === handle || identifiers.includes(handle);
   });
   return match?.id;
 }

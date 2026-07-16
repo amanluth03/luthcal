@@ -657,3 +657,391 @@ rather than a new table.
   force a clarifying question on `"none"`, at the cost of blocking
   legitimate non-family-member event references (e.g. "playdate with
   Emma").
+
+## 9. Passive-listener engagement gate
+
+**The problem this replaces.** Until this change, every inbound message
+that reached `runAgent` (from either channel) got a full model turn and,
+almost always, a reply. That's correct for the dashboard (every message
+there is an explicit, direct request) but wrong for the family iMessage
+GROUP CHAT: an agent that responds to ordinary chatter is the fastest way
+to make a family mute or remove it. Aman's explicit brief for this pass:
+**high precision over recall** — a false "want me to add this?" on
+ordinary conversation is far worse than the agent missing a real one, and
+when unsure the agent should stay silent. "Launch conservative."
+
+New file `lib/agent/engagement.ts`, `decideEngagement(options):
+Promise<EngagementDecision>` — a gate meant to run BEFORE the iMessage
+webhook (backend-dev's file) decides whether to call `runAgent` at all.
+`EngagementDecision` is `{ engage: boolean; reason: "mentioned" |
+"event-detected" | "pending-confirmation" | "none"; mode: "act" | "suggest"
+| "silent" }`. **`"pending-confirmation"` is an addition beyond the two
+triggers in the original task brief — see "Open design questions" below;
+everything else follows the brief directly.**
+
+### The two (plus one) triggers
+
+1. **Explicit mention/direct address** (`isMentioned`, fully deterministic,
+   no model call) — the message contains, as a whole word/phrase (not a
+   substring — "calendars" doesn't match "calendar"), any of a configurable
+   list of agent names/aliases. Default list
+   (`DEFAULT_AGENT_NAMES`): `["LuthCal"]` (see the tech-lead ruling under
+   "Open design questions" #2 — `"calendar"` was removed as a default),
+   overridable via the
+   comma-separated `AGENT_NAMES` env var, with `AGENT_IMESSAGE_HANDLE` (the
+   agent's own dedicated Apple ID/phone, already used elsewhere as the
+   outbound-loop guard — see `app/api/webhooks/bluebubbles/route.ts`) always
+   appended so addressing the agent by its own handle counts too. Matching
+   is case/punctuation-insensitive (`"@LuthCal"`, `"LuthCal!"`, `"hey,
+   calendar?"` all match) via a normalize-then-word-boundary-regex approach,
+   not fuzzy matching — same "exact, predictable, no partial-match guessing"
+   philosophy as `matchMember` (§2). → `{ engage: true, reason: "mentioned",
+   mode: "act" }`.
+2. **Event-with-time detection** (`classifyEventWithTime`, ONE small model
+   call — see "Classifier model choice" below) — a strict binary classifier
+   answers whether the message clearly and unambiguously describes a
+   schedulable event WITH a specific date/time. High-confidence only;
+   anything vague ("we should do dinner sometime"), hypothetical, or a
+   date/time-less logistics message classifies false. → on true: `{ engage:
+   true, reason: "event-detected", mode: "suggest" }`; on false: `{ engage:
+   false, reason: "none", mode: "silent" }`.
+3. **Pending-confirmation reply** (`isPendingConfirmationReply`, fully
+   deterministic, no model call) — see below.
+
+Checked in that order, each check short-circuiting the ones after it —
+**explicit mention never even calls the classifier**, which matters for
+both correctness (an unambiguous mention shouldn't depend on the cheap
+classifier agreeing) and cost (the single cheapest, most common path skips
+the model call entirely).
+
+### Suggest vs. act — what actually constrains the agent
+
+`mode: "act"` is normal operation: full tool access, the existing
+ask-when-genuinely-ambiguous policy from §2 applies as-is. It's used both
+for an explicit mention (the family directly addressed the agent — of
+course it may act) and for a pending-confirmation reply.
+
+`mode: "suggest"` is the passive-detection path, and per the brief **must
+never auto-create — propose, don't create, until a follow-up confirms.**
+This is enforced in TWO places, not just a prompt instruction, mirroring
+every other deterministic backstop already in this module (member-matching,
+duplicate-detection, the conflict re-check):
+
+- **`lib/agent/tools.ts` `buildAgentTools`** — when `ctx.mode === "suggest"`,
+  the returned tool set is built as an explicit allowlist of
+  `{ listEvents, checkConflicts, sendGroupMessage }` — `createEvent`,
+  `updateEvent`, and `deleteEvent` are not in the object AT ALL. The model
+  physically cannot call them this turn, independent of how well it follows
+  the prompt.
+- **`lib/agent/index.ts` `buildSystemPrompt`** — in suggest mode, an extra
+  instruction block explains why (mutating tools are unavailable this
+  turn), tells the model its only job is one short sentence naming
+  who/what/when and asking whether to add it (e.g. *"Want me to add Maya's
+  dentist for Tue 3pm?"*), and explicitly permits a low-key non-suggestion
+  reply if the model, on reflection, doesn't think the message really
+  describes a concrete event — a second line of defense against the cheap
+  classifier's false positives, since the full model gets the final human-
+  facing say even after the classifier said yes.
+
+`RunAgentParams.engagementMode?: "act" | "suggest"` is the wiring: omitted
+(or `"act"`) preserves today's behavior exactly for every existing caller
+(dashboard always omits it — there's no passive-listener concept there).
+Only the iMessage webhook, once wired, would ever pass `"suggest"`.
+
+### Classifier model choice — cost/latency reasoning
+
+The event-with-time classifier runs on **every** non-mention message in an
+active group chat — far more often than the full agent, which (post-gate)
+only runs on messages already decided worth engaging with. Running the full
+tool-loop agent (`lib/agent/index.ts`'s `MODEL`,
+`"anthropic/claude-sonnet-5"` — roster + policy system prompt, up to 8
+tool-call steps, live Google Calendar reads) on every ambient message would
+be slow and needlessly expensive for a task that's just "strict yes/no read
+on one short message, no tools, no multi-step reasoning." The classifier
+instead uses `"anthropic/claude-haiku-4-5"` — Anthropic's fastest/cheapest
+current tier (roughly a third of Sonnet 5's per-token price) — via
+`generateText` + `Output.object` (AI SDK v6's current, non-deprecated
+structured-output path; `generateObject` is marked `@deprecated` in the
+installed `ai` package) with a small zod schema (`{
+isSchedulableEventWithTime: boolean }`) and `maxOutputTokens` capped low,
+since the only output is one JSON boolean. This is a materially different,
+much cheaper call than the main agent turn — exactly the point of putting
+it behind the mention/pending-confirmation short-circuits above, so it
+doesn't run at all when it doesn't need to.
+
+### Fail-safe: classifier failure → silent
+
+If the classifier call throws for any reason (network error, rate limit,
+malformed response), `decideEngagement` catches it and returns `{ engage:
+false, reason: "none", mode: "silent" }` — it never lets an infrastructure
+failure default to engaging. This directly follows the brief's own
+instruction ("if the classifier call fails, default to SILENT... fail
+toward not-annoying") and the module's general precision-over-recall stance:
+an occasional silently-missed real event (because the classifier happened
+to be down) is a far smaller cost than the agent popping up in the group
+chat because of a failure rather than an actual signal.
+
+### No-nag
+
+`decideEngagement` is purely reactive — it only ever runs in response to an
+inbound message and never itself produces output or schedules a follow-up.
+If a suggestion is ignored (no reply at all, or a reply outside the
+pending-confirmation window below), nothing re-raises it. There is no
+proactive/cron nudge mechanism here or planned as part of this module.
+
+### The pending-confirmation extension (flagged for tech-lead)
+
+**Why it exists.** "Suggest mode" only works end-to-end if a reply to the
+agent's own suggestion can actually reach it. Walk through the intended
+flow literally: agent asks *"Want me to add Maya's dentist for Tue 3pm?"*;
+a family member replies *"yes"*. That reply is, on its own, ordinary
+one-word chatter — no explicit mention, no date/time — so without an
+additional check, `decideEngagement` would classify it `silent` and the
+confirmation would never reach `runAgent`. "Suggest mode" would be a dead
+end with no way to actually confirm anything, which can't be the intended
+design.
+
+**The fix, deterministic (no extra model call):**
+`isPendingConfirmationReply` checks whether the agent's own most recent
+message in this thread (a) ends with `"?"` and (b) was sent within
+`PENDING_CONFIRMATION_WINDOW_MS` (15 minutes) of now. If both hold, the
+gate engages with `{ reason: "pending-confirmation", mode: "act" }` —
+full tool access, letting `runAgent`'s existing Level-1 conversation memory
+(BUG 2, §2d) and ask-when-ambiguous policy work out from context whether
+the reply is a yes, a no, a correction, or something unrelated.
+
+New DB-backed helper `lib/agent/history.ts` `loadLastOutboundMessage
+(chatGuid)` — a single-row query (`source = 'imessage' AND chat_guid = ?
+AND direction = 'outbound'`, most recent), deliberately narrower than
+`loadRecentThreadHistory` (no roster, no attribution, no dashboard scope) —
+supplies this. Degrades to `null` (never throws) on any DB error, same
+pattern as every other DB-backed helper in this module.
+
+**Precision trade-off, explicitly:** this check does NOT verify the reply
+is actually about the suggestion — only that the agent's last message
+looked like a question and was recent. An unrelated message sent shortly
+after an ignored suggestion (with nobody else speaking in between) would
+still be treated as a pending-confirmation reply and reach `runAgent` in
+`"act"` mode. The 15-minute window is the mitigation: short enough that
+"the actual reply to a question someone just asked" is a much more likely
+explanation than "an unrelated later message that happened to land in the
+window," but it is a heuristic, not a guarantee. **This is a genuine
+expansion of the `reason`/decision shape given in the original task brief
+(which named only `"mentioned" | "event-detected" | "none"`), not a silent
+one — flagging explicitly for tech-lead review**, since it's the one place
+this module's design goes beyond the brief's literal contract to make the
+suggest/confirm flow actually work.
+
+### Hand-off spec for backend-dev's webhook wiring
+
+Exact sequence `app/api/webhooks/bluebubbles/route.ts` should follow, after
+its existing checks (webhook secret, `isFromMe`/`AGENT_IMESSAGE_HANDLE` loop
+guards, family-chat-guid check, `normalizeInboundText`/empty check) and
+INSTEAD of unconditionally calling `runAgent`:
+
+```ts
+import { decideEngagement } from "@/lib/agent/engagement";
+import { loadLastOutboundMessage } from "@/lib/agent/history";
+
+// still inside the after() callback, so this never blocks the 200 ack to BlueBubbles:
+const last = await loadLastOutboundMessage(chatGuid);
+const decision = await decideEngagement({
+  text,
+  lastAgentMessage: last ? { text: last.text, sentAt: last.createdAt } : undefined,
+});
+
+if (!decision.engage) {
+  // stay silent — see "open question" below on whether this should still
+  // write a message_log row for audit purposes.
+  return;
+}
+
+const result = await runAgent({
+  messages: [{ role: "user", content: text }],
+  source: "imessage",
+  chatGuid,
+  senderHandle,
+  engagementMode: decision.mode === "suggest" ? "suggest" : "act", // decision.mode is never "silent" here since decision.engage is true
+});
+await enqueueOutbound(chatGuid, result.reply);
+```
+
+Both `decideEngagement` and `loadLastOutboundMessage` are exported from
+`lib/agent/` for exactly this purpose. `decideEngagement` makes at most one
+network call (the classifier) and should run inside the same `after()`
+callback the webhook already uses for `runAgent`, so it never delays the
+fast ack back to BlueBubbles.
+
+### Open design questions for tech-lead
+
+1. **Should silently-ignored ambient chatter still get a `message_log`
+   audit row?** Before this gate, every message that reached `runAgent`
+   already got logged (inside `runAgent` itself). Post-gate, a message the
+   gate correctly ignores (`engage: false`) has zero footprint anywhere —
+   no debugging trail for "why didn't the bot respond to X". Worth a
+   decision: log inbound-but-ignored messages somewhere (a debug log line
+   at minimum; a `message_log` row at the cost of a DB write per ambient
+   message at the other extreme) for later tuning of the gate's precision/
+   recall, or leave it as designed (zero cost, zero trail) since that's the
+   entire point of a passive listener. Not decided here.
+2. **`DEFAULT_AGENT_NAMES` and the bare word `"calendar"` — RESOLVED
+   (tech-lead ruling): removed from the default.** A mention resolves to
+   `mode: "act"` (full mutating-tool access — the highest-stakes path in the
+   gate), and `"calendar"` is a maximally common word in this exact domain
+   ("did you see the calendar?", "check the calendar", "my calendar's a mess
+   this week"), so defaulting it would engage the agent in act mode on
+   ordinary chatter that merely talks *about* the calendar — the precise
+   "don't be annoying" failure this gate exists to prevent. The default is
+   now `["LuthCal"]`; a deployment that genuinely wants "calendar" as an
+   address word adds it via `AGENT_NAMES`. Messages that only mention the
+   calendar now fall through to the precision-biased classifier, which
+   correctly stays silent on them. (`lib/agent/engagement.ts`
+   `DEFAULT_AGENT_NAMES`.)
+3. **The pending-confirmation extension itself** (above) — its precision
+   trade-off and 15-minute window are a judgment call, not something the
+   original brief specified. Tech-lead sign-off requested specifically on
+   this piece.
+4. **Should `decideEngagement`'s classifier prompt be tuned/versioned
+   independently of the main agent's system prompt** as real usage data
+   comes in, or should precision/recall tuning happen primarily via the
+   mention list and window constants above? Not decided here — flagging
+   that the classifier prompt (`CLASSIFIER_SYSTEM_PROMPT` in
+   `lib/agent/engagement.ts`) is itself a tunable surface, separate from
+   everything else in this section.
+
+Tests: `tests/agent/engagement.test.ts` — mention detection (bare name,
+case/punctuation robustness, mid-sentence, word-boundary non-match, custom
+`agentNames`, phone-number-style handle, empty inputs), `getDefaultAgentNames`
+env wiring, the event-with-time trigger (mocked classifier true/false across
+several ambient-chatter/vague-plan/logistics-without-time cases), the
+classifier-failure → silent fail-safe path (mocked model throw), and the
+full pending-confirmation matrix (recent question → engages without calling
+the classifier; non-question last message → falls through; expired window →
+falls through; no last message → no-op; mention still takes priority over a
+pending confirmation).
+
+## 10. Identifier consolidation (`family_members.identifiers`)
+
+**The problem.** `resolveSenderMemberId` (§2c, BUG 1) matches an inbound
+sender against `family_members.imessageHandle`/`.phone`. Only Aman's seed
+row ever had anything useful there — his Gmail address was crammed into
+`imessageHandle` (a field whose name implies "iMessage/Apple-ID handle") as
+a one-off workaround — so Yash/Vijay/Ekta's dashboard sessions (or, later,
+iMessage handles) would never resolve to a `family_members` row: every
+event they create shows "Unknown" or their raw email in the activity feed
+instead of their name, and their sent messages never resolve a `member_id`.
+
+**Schema choice: `identifiers: jsonb string[]`, not a dedicated `email`
+column.** A real family member is identifiable by more than one handle at
+once — a Google/dashboard sign-in email, a (possibly different) Apple-ID
+email for iMessage, a phone number (already its own column, `phone`), and
+potentially more over time. A single `email` column would need a second
+`appleIdEmail` column, then a third for whatever comes next — `identifiers`
+is a general-purpose home for "every way we might see this person" that
+doesn't need a new column per new kind of handle, at the cost of losing
+column-level type distinction between "this is an email" vs. "this is
+something else" (acceptable here, since matching is always a flat
+case-insensitive string comparison regardless of what kind of identifier it
+is — see `resolveSenderMemberId` below). `imessageHandle`/`phone` are left
+in place unchanged (not folded into `identifiers`) — they're still useful,
+type-suggestive columns, and removing them would be unnecessary churn for
+no correctness gain; `identifiers` supplements them rather than replacing
+them.
+
+**Migration-safety.** `identifiers` is `NOT NULL` with an empty-array
+default (`jsonb("identifiers").$type<string[]>().notNull().default([])`) —
+`drizzle-kit push` against the already-seeded prod `family_members` table
+adds the column with every existing row defaulting to `[]`, no manual
+backfill required to stay valid. (A real backfill — moving real emails into
+the column — is still needed for the feature to actually work; see the
+re-seed note below.)
+
+**Wiring:**
+- `lib/agent/match-member.ts`'s `RosterMember` interface gains an optional
+  `identifiers?: string[] | null` field, alongside the existing
+  `imessageHandle`/`phone` — not used by `matchMember` itself (name-in-text
+  resolution), only by `resolveSenderMemberId` (who-sent-this resolution),
+  same split as the existing two fields.
+- `lib/agent/index.ts`'s `getFamilyRoster` selects `identifiers` alongside
+  the existing columns (one roster snapshot backs both lookups, per §2c's
+  existing design — no second DB round trip).
+- `lib/agent/resolve-sender.ts`'s `resolveSenderMemberId` now matches
+  `senderHandle` against `imessageHandle` OR `phone` OR any entry in
+  `identifiers` (all exact, trimmed, case-insensitive — same no-fuzzy-match
+  philosophy as everywhere else sender/name resolution happens in this
+  module).
+- `scripts/seed.ts` now sets `identifiers: [<email>]` uniformly for all
+  four family members (Aman, Yash, Vijay, Ekta) using their real
+  Google/dashboard emails, and leaves `imessageHandle`/`phone` as `null`
+  with a `TODO(bridge-setup)` comment each — those need each person's real
+  iMessage-registered phone number/Apple ID, which isn't known yet and will
+  be filled in during BlueBubbles bridge setup.
+
+**Re-seed / manual update needed in prod.** `scripts/seed.ts`'s upsert logic
+skips any member that already exists by name (`family_members.name` has no
+unique constraint, so it does a manual existence check instead of a real
+upsert) — it will NOT retroactively add `identifiers` to Aman's existing
+prod row, and will NOT move his email out of `imessageHandle` (which this
+schema change deliberately doesn't touch/clear on its own — a live row's
+existing `imessageHandle` value is left exactly as constant hosting it
+was). **A one-time manual update (or a small backfill script) is needed in
+prod** to: (a) populate `identifiers` for all four members from the emails
+listed above, and (b) optionally clear Aman's `imessageHandle` back to
+`null` now that his email lives in `identifiers` instead — not run here,
+per the task brief's instruction not to touch the seeded prod DB.
+
+Tests: `resolveSenderMemberId`'s existing test file
+(`tests/agent/resolve-sender.test.ts`) covers `imessageHandle`/`phone`
+matching already; qa-testing owns extending it with `identifiers` coverage
+(see "DELEGATE TO junior-dev" in the final report for a proposed test
+addition, scoped narrow enough to hand off).
+
+## 11. `message_log` source discriminator
+
+**The problem.** `lib/agent/history.ts`'s `loadRecentThreadHistory` (BUG 2,
+§2d) scoped "dashboard thread" history as "every `message_log` row with a
+NULL `chat_guid`" — an assumption, not an enforced fact. Nothing in the
+schema or the write path actually guaranteed an iMessage-sourced row always
+carries a `chat_guid`; if one ever slipped through without one (a bug
+upstream, a future code path that forgets to pass it), it would silently
+and permanently leak into the dashboard's history scope with no error and
+no way to detect it after the fact.
+
+**The fix.** `message_log.source` (`text`, enum `'imessage' | 'dashboard'`,
+nullable, no default — see the column's own doc comment in
+`lib/db/schema.ts` for the migration-safety reasoning) is a positive
+discriminator: scoping now asserts the actual channel a row came from
+instead of inferring it from another column's null-ness.
+
+**Wiring (senior-backend's three pieces, per the task's own scope split):**
+- **Schema** — `lib/db/schema.ts`, the `source` column above.
+- **The write path** — `lib/agent/index.ts`'s `logMessage` now takes a
+  required `source: AgentSource` option and writes it on both the inbound
+  and outbound rows it logs, derived directly from `runAgent`'s own
+  `source` param (never chosen by the model, same as every other
+  deterministic field `logMessage` writes).
+- **The read/scoping path** — `lib/agent/history.ts`'s
+  `loadRecentThreadHistory` signature changed to
+  `(source: AgentSource, chatGuid: string | undefined, roster:
+  RosterMember[])`. Scoping is now `source = 'imessage' AND chat_guid = ?`
+  for iMessage runs (falling back to `source = 'imessage'` alone if
+  `chatGuid` is somehow missing, rather than throwing) and `source =
+  'dashboard'` for dashboard runs. Sender-attribution (name-prefixing
+  inbound rows) is likewise now gated on `source === "imessage"` instead of
+  "chatGuid is truthy" — the same semantic shift, applied consistently.
+  Rows written before this column existed (`source IS NULL`) match neither
+  scope and are simply never pulled back in.
+
+**Explicitly NOT this module's job** (per the task's own scope split,
+backend-dev's follow-up): making the BlueBubbles webhook itself write
+`source: 'imessage'` with a guaranteed `chat_guid` on its own direct
+`message_log` inserts (the two early-return branches in
+`app/api/webhooks/bluebubbles/route.ts` that log directly rather than
+through `runAgent` — wrong-chat and empty-body messages). Those inserts are
+outside `runAgent`/`logMessage`'s write path entirely and are backend-dev's
+file to update; not touched here.
+
+Tests: `tests/agent/history.test.ts`, updated for the new signature and
+extended with an explicit case for `source IS NULL` rows matching neither
+scope, plus new coverage for `loadLastOutboundMessage` (§9's
+pending-confirmation helper, which also depends on this column).

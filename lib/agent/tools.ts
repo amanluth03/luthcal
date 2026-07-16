@@ -21,6 +21,21 @@ export interface AgentToolContext {
   chatGuid?: string;
   /** The family roster this run resolved at prompt-build time — reused here (rather than re-fetched) so createEvent/updateEvent can deterministically resolve memberNames -> ids against the exact same roster the model was shown. */
   roster: RosterMember[];
+  /**
+   * Passive-listener engagement mode (see lib/agent/index.ts's
+   * RunAgentParams.engagementMode and docs/agent-core.md's passive-listener
+   * section). Defaults to "act" — the current, unrestricted tool set —
+   * when omitted, so every existing caller (dashboard, and any test that
+   * doesn't pass this) is unaffected. "suggest" is the deterministic half
+   * of the passive-suggestion contract: buildAgentTools below physically
+   * removes createEvent/updateEvent/deleteEvent from the returned tool set
+   * rather than relying solely on the system-prompt instruction (which
+   * accompanies this for the human-readable "why") — the same
+   * belt-and-suspenders shape as the other deterministic backstops in this
+   * file (member-matching, duplicate-detection): a prompt instruction alone
+   * is never trusted as the sole guard against a mutating action.
+   */
+  mode?: "act" | "suggest";
 }
 
 /**
@@ -94,9 +109,16 @@ function requireFamilyChatGuid(): string {
  * itself never chooses `createdVia` or the destination chat — those are
  * derived from how this run was invoked (iMessage webhook vs. dashboard
  * chat), not from anything the LLM outputs.
+ *
+ * In `mode: "suggest"` (passive-listener event-detection, not an explicit
+ * mention — see AgentToolContext.mode and docs/agent-core.md), the
+ * mutating tools are omitted from the returned object entirely: the model
+ * has no way to call createEvent/updateEvent/deleteEvent this turn even if
+ * it tried, regardless of what the system prompt says or how the model
+ * chooses to (mis)read it.
  */
 export function buildAgentTools(ctx: AgentToolContext) {
-  return {
+  const allTools = {
     createEvent: tool({
       description:
         "Create a new event on the shared family calendar. First checks for a near-identical event that already exists (same title, overlapping time, same family member(s)) — if one is found, NOTHING is created and the result includes duplicateFound instead of event; ask the user to confirm before calling this again with confirmDuplicate: true. After actually creating an event with assigned members, call checkConflicts for the same time range and members, and mention any conflicts in your reply.",
@@ -247,6 +269,20 @@ export function buildAgentTools(ctx: AgentToolContext) {
       },
     }),
   };
+
+  if (ctx.mode === "suggest") {
+    // Deterministically expose only the non-mutating tools — see this
+    // function's doc comment and AgentToolContext.mode. Built as an
+    // explicit allowlist (rather than destructure-and-omit) so there's no
+    // risk of a newly-added mutating tool silently staying available here
+    // by default. listEvents/checkConflicts stay available (read-only,
+    // useful context for phrasing the suggestion); sendGroupMessage stays
+    // available too (it's an extra message, not a calendar mutation).
+    const { listEvents, checkConflicts, sendGroupMessage } = allTools;
+    return { listEvents, checkConflicts, sendGroupMessage };
+  }
+
+  return allTools;
 }
 
 export type AgentTools = ReturnType<typeof buildAgentTools>;

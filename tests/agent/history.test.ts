@@ -4,21 +4,27 @@ import type { ModelMessage } from "ai";
 import type { RosterMember } from "@/lib/agent/match-member";
 
 // ---------------------------------------------------------------------------
-// BUG 2: Level-1 conversation memory. Two things under test:
+// BUG 2: Level-1 conversation memory. Three things under test:
 //
 //  - dedupeHistory (pure): the merge logic that stops the dashboard's
 //    resent history from being doubled up with what loadRecentThreadHistory
 //    pulls back from message_log.
-//  - loadRecentThreadHistory: scope (thread = chatGuid, or NULL chatGuid for
-//    "dashboard"), window (last N rows / last X ms), and sender-attribution
-//    (name-prefixed only when chatGuid is set). Exercised against a fake
-//    in-memory message_log, following the same real-drizzle-operators /
-//    fake-query-builder pattern as tests/google/event-meta-dedup.test.ts, so
-//    the actual production where/orderBy/limit logic runs for real.
+//  - loadRecentThreadHistory: scope (F1 — source discriminator, not
+//    chatGuid null-ness; see docs/agent-core.md "message_log source
+//    discriminator"), window (last N rows / last X ms), and
+//    sender-attribution (name-prefixed only for source "imessage").
+//    Exercised against a fake in-memory message_log, following the same
+//    real-drizzle-operators / fake-query-builder pattern as
+//    tests/google/event-meta-dedup.test.ts, so the actual production
+//    where/orderBy/limit logic runs for real.
+//  - loadLastOutboundMessage: the narrower single-row helper the
+//    passive-listener engagement gate (lib/agent/engagement.ts) uses for
+//    its pending-confirmation check.
 // ---------------------------------------------------------------------------
 
 interface FakeMessageLogRow {
   direction: "inbound" | "outbound";
+  source: "imessage" | "dashboard" | null;
   chatGuid: string | null;
   senderHandle: string | null;
   memberId: string | null;
@@ -96,10 +102,10 @@ vi.mock("@/lib/db", () => ({
 
 // Imported AFTER the mocks above so the module under test picks them up.
 import { messageLog } from "@/lib/db/schema";
-import { dedupeHistory, HISTORY_MAX_AGE_MS, HISTORY_MESSAGE_LIMIT, loadRecentThreadHistory } from "@/lib/agent/history";
+import { dedupeHistory, HISTORY_MAX_AGE_MS, HISTORY_MESSAGE_LIMIT, loadLastOutboundMessage, loadRecentThreadHistory } from "@/lib/agent/history";
 
 function seedRow(row: Partial<FakeMessageLogRow> & { direction: "inbound" | "outbound"; text: string; createdAt: Date }) {
-  state.rows.push({ chatGuid: null, senderHandle: null, memberId: null, ...row });
+  state.rows.push({ source: null, chatGuid: null, senderHandle: null, memberId: null, ...row });
 }
 
 beforeEach(() => {
@@ -151,35 +157,42 @@ describe("dedupeHistory(history, callerMessages)", () => {
 
 const roster: RosterMember[] = [{ id: "m-aman", name: "Aman", aliases: [], imessageHandle: "aman@example.com", phone: null }];
 
-describe("loadRecentThreadHistory(chatGuid, roster)", () => {
-  it("scopes to the given chatGuid, excluding rows from other chats and NULL-chatGuid (dashboard) rows", async () => {
-    seedRow({ direction: "inbound", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
-    seedRow({ direction: "inbound", chatGuid: "chat-b", text: "in chat b", createdAt: new Date() });
-    seedRow({ direction: "inbound", chatGuid: null, text: "dashboard message", createdAt: new Date() });
+describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
+  it("scopes to source 'imessage' + the given chatGuid, excluding other chats and dashboard rows", async () => {
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-b", text: "in chat b", createdAt: new Date() });
+    seedRow({ direction: "inbound", source: "dashboard", chatGuid: null, text: "dashboard message", createdAt: new Date() });
 
-    const history = await loadRecentThreadHistory("chat-a", []);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", []);
     expect(history).toHaveLength(1);
     expect(history[0].content).toBe("in chat a");
   });
 
-  it("scopes to NULL chatGuid rows (dashboard thread) when chatGuid is undefined", async () => {
-    seedRow({ direction: "inbound", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
-    seedRow({ direction: "inbound", chatGuid: null, text: "dashboard message", createdAt: new Date() });
+  it("scopes to source 'dashboard' rows when source is 'dashboard', regardless of chatGuid", async () => {
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
+    seedRow({ direction: "inbound", source: "dashboard", chatGuid: null, text: "dashboard message", createdAt: new Date() });
 
-    const history = await loadRecentThreadHistory(undefined, []);
+    const history = await loadRecentThreadHistory("dashboard", undefined, []);
     expect(history).toHaveLength(1);
     expect(history[0].content).toBe("dashboard message");
+  });
+
+  it("F1: rows with no source at all (written before the column existed) match neither scope", async () => {
+    seedRow({ direction: "inbound", source: null, chatGuid: "chat-a", text: "pre-migration row", createdAt: new Date() });
+
+    expect(await loadRecentThreadHistory("imessage", "chat-a", [])).toEqual([]);
+    expect(await loadRecentThreadHistory("dashboard", undefined, [])).toEqual([]);
   });
 
   it("returns rows oldest-first even though they're queried newest-first (for the LIMIT)", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-13T12:00:00Z"));
 
-    seedRow({ direction: "inbound", chatGuid: "chat-a", text: "first", createdAt: new Date("2026-07-13T10:00:00Z") });
-    seedRow({ direction: "outbound", chatGuid: "chat-a", text: "second", createdAt: new Date("2026-07-13T10:01:00Z") });
-    seedRow({ direction: "inbound", chatGuid: "chat-a", text: "third", createdAt: new Date("2026-07-13T10:02:00Z") });
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "first", createdAt: new Date("2026-07-13T10:00:00Z") });
+    seedRow({ direction: "outbound", source: "imessage", chatGuid: "chat-a", text: "second", createdAt: new Date("2026-07-13T10:01:00Z") });
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "third", createdAt: new Date("2026-07-13T10:02:00Z") });
 
-    const history = await loadRecentThreadHistory("chat-a", []);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", []);
     expect(history.map((m) => m.content)).toEqual(["first", "second", "third"]);
     expect(history.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
   });
@@ -189,15 +202,16 @@ describe("loadRecentThreadHistory(chatGuid, roster)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
 
-    seedRow({ direction: "inbound", chatGuid: "chat-a", text: "recent", createdAt: new Date(now.getTime() - 1000) });
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "recent", createdAt: new Date(now.getTime() - 1000) });
     seedRow({
       direction: "inbound",
+      source: "imessage",
       chatGuid: "chat-a",
       text: "stale",
       createdAt: new Date(now.getTime() - HISTORY_MAX_AGE_MS - 1000),
     });
 
-    const history = await loadRecentThreadHistory("chat-a", []);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", []);
     expect(history.map((m) => m.content)).toEqual(["recent"]);
   });
 
@@ -207,19 +221,20 @@ describe("loadRecentThreadHistory(chatGuid, roster)", () => {
 
     const base = new Date("2026-07-13T12:00:00Z").getTime();
     for (let i = 0; i < HISTORY_MESSAGE_LIMIT + 5; i++) {
-      seedRow({ direction: "inbound", chatGuid: "chat-a", text: `msg-${i}`, createdAt: new Date(base + i * 1000) });
+      seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: `msg-${i}`, createdAt: new Date(base + i * 1000) });
     }
 
-    const history = await loadRecentThreadHistory("chat-a", []);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", []);
     expect(history).toHaveLength(HISTORY_MESSAGE_LIMIT);
     // Oldest 5 (msg-0..msg-4) fall outside the LIMIT-most-recent window.
     expect(history[0].content).toBe("msg-5");
     expect(history[history.length - 1].content).toBe(`msg-${HISTORY_MESSAGE_LIMIT + 4}`);
   });
 
-  it("prefixes inbound messages with the resolved member's name when chatGuid is set (multi-sender iMessage thread)", async () => {
+  it("prefixes inbound messages with the resolved member's name for source 'imessage' (multi-sender thread)", async () => {
     seedRow({
       direction: "inbound",
+      source: "imessage",
       chatGuid: "chat-a",
       memberId: "m-aman",
       senderHandle: "aman@example.com",
@@ -227,13 +242,14 @@ describe("loadRecentThreadHistory(chatGuid, roster)", () => {
       createdAt: new Date(),
     });
 
-    const history = await loadRecentThreadHistory("chat-a", roster);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", roster);
     expect(history[0].content).toBe("Aman: dentist for Maya tuesday");
   });
 
   it("falls back to the raw senderHandle when memberId doesn't resolve to a roster name", async () => {
     seedRow({
       direction: "inbound",
+      source: "imessage",
       chatGuid: "chat-a",
       memberId: null,
       senderHandle: "+15125550199",
@@ -241,13 +257,14 @@ describe("loadRecentThreadHistory(chatGuid, roster)", () => {
       createdAt: new Date(),
     });
 
-    const history = await loadRecentThreadHistory("chat-a", roster);
+    const history = await loadRecentThreadHistory("imessage", "chat-a", roster);
     expect(history[0].content).toBe("+15125550199: hi");
   });
 
-  it("does NOT prefix dashboard (NULL chatGuid) history, even with a resolvable member", async () => {
+  it("does NOT prefix dashboard (source 'dashboard') history, even with a resolvable member", async () => {
     seedRow({
       direction: "inbound",
+      source: "dashboard",
       chatGuid: null,
       memberId: "m-aman",
       senderHandle: "aman@example.com",
@@ -255,12 +272,51 @@ describe("loadRecentThreadHistory(chatGuid, roster)", () => {
       createdAt: new Date(),
     });
 
-    const history = await loadRecentThreadHistory(undefined, roster);
+    const history = await loadRecentThreadHistory("dashboard", undefined, roster);
     expect(history[0].content).toBe("book dentist");
   });
 
   it("degrades to [] (no throw) when getDb() throws — e.g. no DATABASE_URL set", async () => {
     state.throwOnGetDb = true;
-    await expect(loadRecentThreadHistory("chat-a", [])).resolves.toEqual([]);
+    await expect(loadRecentThreadHistory("imessage", "chat-a", [])).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadLastOutboundMessage — the narrower helper the passive-listener
+// engagement gate (lib/agent/engagement.ts) uses for pending-confirmation.
+// ---------------------------------------------------------------------------
+
+describe("loadLastOutboundMessage(chatGuid)", () => {
+  it("returns the most recent outbound row for that chat", async () => {
+    seedRow({ direction: "outbound", source: "imessage", chatGuid: "chat-a", text: "older reply", createdAt: new Date("2026-07-13T10:00:00Z") });
+    seedRow({ direction: "outbound", source: "imessage", chatGuid: "chat-a", text: "newer reply?", createdAt: new Date("2026-07-13T10:05:00Z") });
+
+    const result = await loadLastOutboundMessage("chat-a");
+    expect(result).not.toBeNull();
+    expect(result?.text).toBe("newer reply?");
+    expect(result?.createdAt).toEqual(new Date("2026-07-13T10:05:00Z"));
+  });
+
+  it("ignores inbound rows and rows from a different chat", async () => {
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "user said this", createdAt: new Date() });
+    seedRow({ direction: "outbound", source: "imessage", chatGuid: "chat-b", text: "reply in a different chat", createdAt: new Date() });
+
+    expect(await loadLastOutboundMessage("chat-a")).toBeNull();
+  });
+
+  it("ignores dashboard-source rows even if chatGuid somehow matched", async () => {
+    seedRow({ direction: "outbound", source: "dashboard", chatGuid: "chat-a", text: "dashboard reply", createdAt: new Date() });
+
+    expect(await loadLastOutboundMessage("chat-a")).toBeNull();
+  });
+
+  it("returns null when there is no outbound message yet", async () => {
+    expect(await loadLastOutboundMessage("chat-a")).toBeNull();
+  });
+
+  it("degrades to null (no throw) when getDb() throws", async () => {
+    state.throwOnGetDb = true;
+    await expect(loadLastOutboundMessage("chat-a")).resolves.toBeNull();
   });
 });

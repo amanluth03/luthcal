@@ -14,6 +14,23 @@ export const familyMembers = pgTable("family_members", {
   phone: text("phone"),
   color: text("color"),
   aliases: jsonb("aliases").$type<string[]>().notNull().default([]),
+  // Every other identifier this member is known by — Google/dashboard sign-in
+  // email, Apple-ID email, additional phone numbers, etc. Added because
+  // `imessageHandle`/`phone` are single-value columns, but a real family
+  // member is reachable/identifiable by more than one handle at once (their
+  // Google email for the dashboard is frequently NOT the same address as
+  // their iMessage Apple ID). Before this column, only Aman's seed row had
+  // his Gmail crammed into `imessageHandle` — a bespoke, non-scalable fix —
+  // so nobody else's inbound sender ever resolved to a family_members row.
+  // `identifiers` is the general-purpose home for "every way we might see
+  // this person" going forward; `resolveSenderMemberId`
+  // (lib/agent/resolve-sender.ts) matches a sender against
+  // imessageHandle/phone/identifiers together. See docs/agent-core.md
+  // "Identifier consolidation" for the full design note. Migration-safe:
+  // NOT NULL with an empty-array default, so existing rows (and drizzle-kit
+  // push against the already-seeded prod DB) don't need a manual backfill to
+  // stay valid — they just start with no extra identifiers until re-seeded.
+  identifiers: jsonb("identifiers").$type<string[]>().notNull().default([]),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -69,6 +86,19 @@ export const messageLog = pgTable("message_log", {
   chatGuid: text("chat_guid"),
   senderHandle: text("sender_handle"),
   memberId: uuid("member_id"),
+  // Positive discriminator for which channel this row came from. Before this
+  // column, `lib/agent/history.ts` scoped "dashboard thread" history as
+  // "every row with a NULL chat_guid" — an unenforced assumption that
+  // iMessage rows always carry a chat_guid, rather than a real, checkable
+  // fact. `source` lets scoping assert the actual channel instead of
+  // inferring it from another column's null-ness. Nullable (no default):
+  // rows written before this column existed have no source and are simply
+  // excluded from both scopes going forward rather than being backfilled —
+  // there's no reliable way to infer their true channel after the fact, and
+  // pre-launch history has no real value to preserve. See
+  // docs/agent-core.md "message_log source discriminator" for the full
+  // design note and lib/agent/history.ts for the scoping logic.
+  source: text("source", { enum: ["imessage", "dashboard"] }),
   text: text("text").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()

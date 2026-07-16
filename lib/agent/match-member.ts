@@ -22,6 +22,14 @@ export interface RosterMember {
    */
   imessageHandle?: string | null;
   phone?: string | null;
+  /**
+   * Optional — every other identifier this member is known by (Google/
+   * dashboard email, Apple-ID email, additional phone numbers, etc.). Same
+   * "who sent this" purpose as imessageHandle/phone above, matched
+   * alongside them by resolveSenderMemberId. Not used by matchMember
+   * itself. See docs/agent-core.md "Identifier consolidation".
+   */
+  identifiers?: string[] | null;
 }
 
 export type MatchResult =

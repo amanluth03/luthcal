@@ -50,6 +50,28 @@ export interface RunAgentParams {
    * dashboard activity feed can show a real name instead of "Unknown".
    */
   senderHandle?: string;
+  /**
+   * Passive-listener engagement mode for this turn — see
+   * `lib/agent/engagement.ts` `decideEngagement()` and docs/agent-core.md's
+   * passive-listener section. Only meaningful (and only ever set) for
+   * `source: "imessage"`: the dashboard is always a direct, explicit
+   * request, so it has no passive-listener concept and always runs as if
+   * `mode: "act"` (the default when this is omitted).
+   *
+   * - `"act"` (default) — normal operation: the model may call
+   *   createEvent/updateEvent/deleteEvent directly, subject only to the
+   *   existing ask-when-genuinely-ambiguous policy in the system prompt.
+   * - `"suggest"` — this run was triggered by passive event-detection, NOT
+   *   an explicit mention. createEvent/updateEvent/deleteEvent are removed
+   *   from the tool set entirely (see `lib/agent/tools.ts` `buildAgentTools`)
+   *   so the model cannot mutate the calendar this turn no matter what it
+   *   decides — it can only describe the event it detected and ask whether
+   *   to add it. A follow-up turn (the family confirming) is expected to
+   *   come back through the passive-listener gate's "pending-confirmation"
+   *   path with `mode: "act"`, at which point the model has full tool
+   *   access again and can actually create the event.
+   */
+  engagementMode?: "act" | "suggest";
 }
 
 export interface RunAgentResult {
@@ -64,8 +86,8 @@ export interface RunAgentResult {
 async function getFamilyRoster(): Promise<RosterMember[]> {
   try {
     const db = getDb();
-    // imessageHandle/phone are fetched here too (not just id/name/aliases)
-    // so this single roster snapshot can also back BUG 1's
+    // imessageHandle/phone/identifiers are fetched here too (not just
+    // id/name/aliases) so this single roster snapshot can also back BUG 1's
     // resolveSenderMemberId and BUG 2's sender-attributed history, without
     // a second DB round trip. They're never shown to the model (formatRoster
     // below only renders name/aliases) — no prompt-hygiene concern.
@@ -76,6 +98,7 @@ async function getFamilyRoster(): Promise<RosterMember[]> {
         aliases: familyMembers.aliases,
         imessageHandle: familyMembers.imessageHandle,
         phone: familyMembers.phone,
+        identifiers: familyMembers.identifiers,
       })
       .from(familyMembers);
   } catch (err) {
@@ -96,12 +119,18 @@ function formatRoster(roster: RosterMember[]): string {
     .join("\n");
 }
 
-function buildSystemPrompt(source: AgentSource, roster: RosterMember[]): string {
+function buildSystemPrompt(source: AgentSource, roster: RosterMember[], mode: "act" | "suggest"): string {
   const tz = getFamilyTimeZone();
 
   return `You are LuthCal, the scheduling assistant for the Luthra family. You normally live in their iMessage group chat${
     source === "dashboard" ? ", but this particular message came from the family's web dashboard, not the group chat" : ""
-  } and turn plain-language messages into events on their shared Google Calendar.
+  } and turn plain-language messages into events on their shared Google Calendar.${
+    mode === "suggest"
+      ? `
+
+PASSIVE-SUGGESTION MODE FOR THIS TURN: nobody explicitly addressed you — this message was noticed by passive, ambient monitoring of the group chat because it looks like it describes a schedulable event. createEvent, updateEvent, and deleteEvent are UNAVAILABLE to you this turn (they are not in your tool list) — you cannot create, change, or cancel anything right now, on purpose. Your only job is to reply with ONE short sentence that (a) names who/what/when you think this is, and (b) asks whether to add it — e.g. "Want me to add Maya's dentist for Tue 3pm?". Do not use listEvents/checkConflicts speculatively for this — just ask. If a reply later confirms it, you'll be re-invoked with full tool access to actually create it and can use conversation history above to see what was suggested. If the message turns out NOT to actually describe a concrete event on reflection, it's fine (and preferred) to reply with something brief and low-key rather than force a suggestion, or even just acknowledge lightly — this passive path is deliberately conservative and a soft miss here is much cheaper than a wrong or annoying suggestion.`
+      : ""
+  }
 
 Current date/time: ${formatNowForPrompt(tz)} (${tz}). Resolve all relative dates ("tomorrow", "next Friday", "in two weeks") against this.
 
@@ -126,12 +155,13 @@ How to operate:
 
 async function logMessage(
   direction: "inbound" | "outbound",
-  opts: { chatGuid?: string; senderHandle?: string; memberId?: string; text: string },
+  opts: { source: AgentSource; chatGuid?: string; senderHandle?: string; memberId?: string; text: string },
 ): Promise<void> {
   try {
     const db = getDb();
     await db.insert(messageLog).values({
       direction,
+      source: opts.source,
       chatGuid: opts.chatGuid,
       senderHandle: opts.senderHandle,
       memberId: opts.memberId,
@@ -224,7 +254,14 @@ async function surfaceConflictWarnings(actions: AgentAction[]): Promise<string[]
 // Entry point
 // ---------------------------------------------------------------------------
 
-export async function runAgent({ messages, source, chatGuid, senderHandle }: RunAgentParams): Promise<RunAgentResult> {
+export async function runAgent({ messages, source, chatGuid, senderHandle, engagementMode }: RunAgentParams): Promise<RunAgentResult> {
+  // Deterministic, never chosen by the model — see RunAgentParams'
+  // engagementMode doc comment and docs/agent-core.md's passive-listener
+  // section. Always "act" for source "dashboard" (no passive-listener
+  // concept there) and whenever the caller omits it (preserves today's
+  // behavior for every existing caller).
+  const mode: "act" | "suggest" = engagementMode ?? "act";
+
   // Fetched once and reused for the prompt, the tools, AND (BUG 1/BUG 2
   // below) sender/history resolution, so createEvent/updateEvent's
   // memberNames resolution (see lib/agent/tools.ts resolveMemberNames) is
@@ -236,7 +273,7 @@ export async function runAgent({ messages, source, chatGuid, senderHandle }: Run
   // BEFORE logging the current turn below, so the turn being submitted right
   // now is never pulled back in as its own "history". See lib/agent/history.ts
   // and docs/agent-core.md for scope/window/dedup details.
-  const history = await loadRecentThreadHistory(chatGuid, roster);
+  const history = await loadRecentThreadHistory(source, chatGuid, roster);
 
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (lastUserMessage) {
@@ -247,11 +284,11 @@ export async function runAgent({ messages, source, chatGuid, senderHandle }: Run
     // activity feed shows the raw handle/email rather than "Unknown") when
     // it doesn't match anyone on the roster.
     const memberId = resolveSenderMemberId(senderHandle, roster);
-    await logMessage("inbound", { chatGuid, senderHandle, memberId, text: lastUserMessage.content });
+    await logMessage("inbound", { source, chatGuid, senderHandle, memberId, text: lastUserMessage.content });
   }
 
-  const system = buildSystemPrompt(source, roster);
-  const tools = buildAgentTools({ source, chatGuid, roster });
+  const system = buildSystemPrompt(source, roster, mode);
+  const tools = buildAgentTools({ source, chatGuid, roster, mode });
 
   const callerModelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
     m.role === "user" ? { role: "user", content: m.content } : { role: "assistant", content: m.content },
@@ -275,7 +312,7 @@ export async function runAgent({ messages, source, chatGuid, senderHandle }: Run
   const warnings = await surfaceConflictWarnings(actions);
   const reply = warnings.length > 0 && !result.text.includes("⚠️") ? `${result.text}\n\n${warnings.join("\n")}`.trim() : result.text;
 
-  await logMessage("outbound", { chatGuid, text: reply });
+  await logMessage("outbound", { source, chatGuid, text: reply });
 
   return { reply, actions };
 }
