@@ -28,6 +28,51 @@ identity so its texts show up as a distinct participant in the group chat
    person). The agent now receives every message sent to the group and can
    send back.
 
+## 1a. The agent is a passive listener, not a bot that replies to everything
+
+Once wired into the group chat, the agent does **not** respond to every
+message it sees — it passively monitors and only engages when one of three
+things happens (`lib/agent/engagement.ts` `decideEngagement`, see
+docs/agent-core.md §9 for the full design):
+
+1. **It's addressed by name.** The message contains "LuthCal" (or one of the
+   names/aliases configured via `AGENT_NAMES`, see §5) as a whole
+   word/phrase — "hey LuthCal, add..." or "@LuthCal what's on Tuesday?" both
+   count; a bare mention of "the calendar" does **not** (that's deliberately
+   excluded — see the ruling in `lib/agent/engagement.ts`
+   `DEFAULT_AGENT_NAMES`, it's too common a word in ordinary chatter). An
+   explicit mention gets full tool access — the agent can create, move, or
+   delete events directly, same as always.
+2. **It detects a concrete event with a specific day/time**, with high
+   confidence, from an unaddressed message ("Maya has a dentist appt Tuesday
+   at 3"). It does **not** create anything on its own in this case — it
+   replies with a short question ("Want me to add Maya's dentist for Tue
+   3pm?") and waits for confirmation. This is intentionally conservative:
+   the agent would rather miss an occasional real event than interrupt
+   ordinary family conversation with a wrong or unwanted suggestion.
+3. **Someone replies to its own pending question within 15 minutes.** A
+   "yes"/"no"/correction sent shortly after the agent asked something is
+   treated as answering that question (full tool access for that turn) —
+   this is what actually lets case 2's suggestion get confirmed and turned
+   into a real event.
+
+Anything else — ordinary conversation, logistics chatter, vague plans with
+no day/time — gets **no reply and no database record at all**; that's the
+whole point of a passive listener (a bot that chimes in on every message is
+the fastest way to get muted or removed from the group chat).
+
+**`AGENT_NAMES` and `AGENT_IMESSAGE_HANDLE` both affect mention detection.**
+`AGENT_NAMES` (comma-separated, optional — defaults to just `"LuthCal"`) is
+the list of names/aliases that count as "addressing the agent directly" in
+case 1 above. `AGENT_IMESSAGE_HANDLE` — the dedicated Apple ID from §1,
+already required as the loop-guard belt-and-suspenders check — is
+**automatically appended** to that list too, so addressing the agent by its
+own handle directly (rare over iMessage, but possible) also counts as a
+mention. **Set `AGENT_IMESSAGE_HANDLE` to the agent's actual Apple ID/phone
+number during setup** (see §1 and §5) — it does double duty: the loop guard
+that stops the agent from replying to itself, and a second way to address it
+by name.
+
 ## 2. The Mac
 
 BlueBubbles requires a real Mac (Apple's iMessage stack isn't available
@@ -113,7 +158,8 @@ In the LuthCal Vercel project (`vercel env add ...` or the dashboard):
 | `BLUEBUBBLES_WEBHOOK_SECRET` | A long random string you generate (e.g. `openssl rand -hex 32`) — guards the inbound webhook, see §6 |
 | `BLUEBUBBLES_SEND_METHOD` | `apple-script` (default) or `private-api` — see §8 |
 | `FAMILY_CHAT_GUID` | The group chat's GUID — see §7 |
-| `AGENT_IMESSAGE_HANDLE` | The dedicated Apple ID from §1 (the same email/phone signed into Messages.app on the bridge Mac) — a defense-in-depth loop guard, see §6 |
+| `AGENT_IMESSAGE_HANDLE` | The dedicated Apple ID from §1 (the same email/phone signed into Messages.app on the bridge Mac) — a defense-in-depth loop guard (see §6) AND counts as a mention for the passive-listener gate (see §1a) |
+| `AGENT_NAMES` | Optional, comma-separated (e.g. `LuthCal,Cal`) — names/aliases that count as directly addressing the agent, see §1a. Defaults to just `LuthCal` if unset. |
 | `CRON_SECRET` | A long random string — guards every `/api/cron/*` endpoint (see vercel.json). Also used by the external GitHub Actions cron pinger — see docs/cron-pinger.md |
 
 ## 6. Register the webhook
@@ -218,9 +264,15 @@ it's not worth the security trade-off.
 
 1. `vercel env pull` locally (or check the Vercel dashboard) to confirm all
    the vars from §5 are set on the deployment.
-2. Text the family group chat something simple ("test from setup").
-   `app/api/webhooks/bluebubbles` should log it to `message_log`, run the
-   agent, and enqueue a reply in `outbound_queue`.
+2. Text the family group chat something that directly addresses the agent,
+   e.g. **"LuthCal, test from setup"** — a bare "test from setup" with no
+   mention and no concrete event/time is exactly the kind of ordinary
+   chatter the passive-listener gate is designed to ignore (see §1a), so it
+   may correctly produce no reply at all and isn't a reliable end-to-end
+   check on its own. An explicit "LuthCal, ..." message always engages.
+   `app/api/webhooks/bluebubbles` should run the agent and enqueue a reply
+   in `outbound_queue`; check the Vercel function logs for a
+   `gate: silent` line if a non-addressed test message doesn't produce one.
 3. Within a few minutes, `app/api/cron/outbound` (vercel.json's retry sweep)
    should pick that row up and actually deliver it — you should see the
    agent's reply show up in the group chat.

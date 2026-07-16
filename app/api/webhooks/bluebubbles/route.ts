@@ -1,6 +1,8 @@
 import { after } from "next/server";
 
 import { runAgent } from "@/lib/agent";
+import { decideEngagement } from "@/lib/agent/engagement";
+import { loadLastOutboundMessage } from "@/lib/agent/history";
 import { enqueueOutbound } from "@/lib/agent/outbound";
 import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-inbound";
 import { getDb } from "@/lib/db";
@@ -164,33 +166,66 @@ export async function POST(request: Request) {
     return new Response(null, { status: 200 });
   }
 
-  // F7 (tech-lead follow-up): everything from here on *does* reach
-  // runAgent, and runAgent logs its own inbound message internally (see
-  // docs/agent-core.md) — so this webhook deliberately does NOT also call
-  // logInbound for this message. Logging it here too produced a second,
-  // near-duplicate message_log row for every in-family message; runAgent's
-  // internal log is now the single source of truth for anything that
-  // actually reaches the agent. The two branches above (wrong chat, empty
-  // body) still log here directly, since those never reach runAgent at all
-  // and would otherwise have no audit trail.
+  // F7 (tech-lead follow-up): everything from here on *does* reach the
+  // passive-listener engagement gate (lib/agent/engagement.ts
+  // `decideEngagement`, see docs/agent-core.md §9) — but only messages the
+  // gate decides to engage with go on to reach runAgent, which logs its own
+  // inbound message internally (see docs/agent-core.md). This webhook
+  // deliberately does NOT also call logInbound for this message: doing so
+  // unconditionally would produce a second, near-duplicate message_log row
+  // for every in-family message, and per tech-lead's explicit ruling on
+  // "open design question #1" in docs/agent-core.md §9, ambient chatter the
+  // gate silently ignores gets ZERO message_log footprint on purpose (that's
+  // the point of a passive listener) rather than a debug audit row. The two
+  // branches above (wrong chat, empty body) still log here directly, since
+  // those never reach the gate/runAgent at all and would otherwise have no
+  // audit trail.
 
-  // Respond to BlueBubbles fast; do the actual NLU + Google Calendar +
-  // outbound-enqueue work after the response is flushed (mirrors
+  // Respond to BlueBubbles fast; do the actual gate-check + NLU + Google
+  // Calendar + outbound-enqueue work after the response is flushed (mirrors
   // app/api/webhooks/google/route.ts's use of `after()` for the same
-  // "acknowledge fast, work after" reason).
+  // "acknowledge fast, work after" reason). Both the engagement gate's
+  // classifier call (decideEngagement makes at most one network call) and
+  // runAgent run inside this same after() callback, so neither ever delays
+  // the 200 ack to BlueBubbles below.
   after(async () => {
     try {
-      // v1: pass just this single inbound message as the whole
-      // conversation. runAgent has no multi-turn context beyond what's
-      // passed in `messages` — wiring in recent message_log rows as prior
-      // turns would need turn/sender attribution across a group chat with
-      // multiple humans, which is more than a one-line change here. Noted
-      // as a reasonable v2 rather than built speculatively.
+      // Passive-listener engagement gate (lib/agent/engagement.ts,
+      // docs/agent-core.md §9) — decides whether this message should
+      // engage the agent at all and, if so, in "act" (full tool access —
+      // explicit mention, or a reply to the agent's own recent question) or
+      // "suggest" (passive event-detection only, no mutating tools) mode.
+      // agentNames is deliberately omitted so decideEngagement reads
+      // AGENT_NAMES/AGENT_IMESSAGE_HANDLE from env itself.
+      const last = await loadLastOutboundMessage(chatGuid);
+      const decision = await decideEngagement({
+        text,
+        lastAgentMessage: last ? { text: last.text, sentAt: last.createdAt } : undefined,
+      });
+
+      if (!decision.engage) {
+        // Precision-over-recall, per tech-lead's ruling (docs/agent-core.md
+        // §9, "open design question #1"): ordinary group-chat chatter the
+        // gate correctly ignores gets no message_log row at all, not even a
+        // DB write — a console line is enough of a debugging trail for
+        // tuning the gate later.
+        console.info("[api/webhooks/bluebubbles] gate: silent", { reason: decision.reason, textLen: text.length });
+        return;
+      }
+
+      // v1: pass just this single inbound message as the whole `messages`
+      // array handed to runAgent explicitly — runAgent itself now loads
+      // recent message_log rows for this thread as prior-turn context
+      // internally (Level-1 conversation memory, docs/agent-core.md §2d),
+      // so this is not the whole story the model sees, just what this
+      // webhook passes as the newly-arrived turn.
       const result = await runAgent({
         messages: [{ role: "user", content: text }],
         source: "imessage",
         chatGuid,
         senderHandle,
+        // decision.mode is never "silent" here since decision.engage is true.
+        engagementMode: decision.mode === "suggest" ? "suggest" : "act",
       });
       await enqueueOutbound(chatGuid, result.reply);
     } catch (err) {
