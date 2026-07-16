@@ -1,3 +1,4 @@
+import { auth } from "@/auth";
 import { runAgent, type RunAgentMessage } from "@/lib/agent";
 import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-inbound";
 
@@ -39,18 +40,24 @@ import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-
 //     RunAgentResult (lib/agent/index.ts) returned as-is.
 //
 // Error responses: { error: string }
+//   - 401: no valid (allowlisted) Google session — see auth.ts.
 //   - 400: invalid/absent JSON body, wrong shape, empty `messages`, last
 //     message not role "user", or its content is empty/whitespace-only or
 //     too long.
 //   - 500: runAgent threw (upstream model/tool failure).
 //
-// TODO(production): this route has no auth guard yet. It's fine for local
-// dashboard use against `next dev`, but before this is reachable in
-// production it needs the same kind of shared-secret/session check the rest
-// of the dashboard uses (FAMILY_PASSCODE) — see frontend-design's dashboard
-// auth for the pattern to match.
+// Auth: proxy.ts's matcher already gates this path (redirects/401s
+// unauthenticated browser navigation before it reaches here). This route
+// re-checks the session itself as defense in depth — see proxy.ts's config
+// comment — so it stays safe even if the proxy matcher is ever loosened by
+// a future edit that doesn't touch this file.
 // -----------------------------------------------------------------------------
 export async function POST(request: Request) {
+  const session = await auth();
+  if (!session) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   let body: unknown;
   try {
     body = await request.json();

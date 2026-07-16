@@ -7,6 +7,7 @@ import { MemberAvatar } from "@/components/member/member-avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -42,15 +43,17 @@ export function FamilySwitcher({ members }: { members: FamilyMember[] }) {
         <ChevronsUpDown className="size-3.5 text-muted-foreground" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-56">
-        <DropdownMenuLabel>Viewing as</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {members.map((m) => (
-          <DropdownMenuItem key={m.id} onClick={() => setActiveId(m.id)}>
-            <MemberAvatar member={m} size="sm" />
-            <span className="flex-1 truncate">{m.name}</span>
-            {m.id === active.id && <Check className="size-3.5" />}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Viewing as</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          {members.map((m) => (
+            <DropdownMenuItem key={m.id} onClick={() => setActiveId(m.id)}>
+              <MemberAvatar member={m} size="sm" />
+              <span className="flex-1 truncate">{m.name}</span>
+              {m.id === active.id && <Check className="size-3.5" />}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -1,9 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { Megaphone } from "lucide-react";
 import type { DigestEntry, DigestKind } from "@/lib/mock/types";
 import { formatDayHeading, groupByDay } from "@/lib/format";
 import { DigestCard } from "@/components/digests/digest-card";
+import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const FILTERS: Array<{ value: DigestKind | "all"; label: string }> = [
@@ -31,10 +33,16 @@ export function DigestFeed({ digests, tz }: { digests: DigestEntry[]; tz: string
         </TabsList>
       </Tabs>
 
-      {groups.length === 0 && (
-        <p className="py-10 text-center text-sm text-muted-foreground">
-          No digests to show for this filter yet.
-        </p>
+      {groups.length === 0 && digests.length === 0 && (
+        <EmptyState
+          icon={Megaphone}
+          title="No digests yet"
+          description="Daily and weekly digests the agent posts to the group chat will show up here once they start going out."
+        />
+      )}
+
+      {groups.length === 0 && digests.length > 0 && (
+        <EmptyState icon={Megaphone} title="No digests match this filter" />
       )}
 
       <div className="flex flex-col gap-6">
