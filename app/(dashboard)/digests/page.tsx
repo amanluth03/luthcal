@@ -1,13 +1,18 @@
-import { dataAdapter } from "@/lib/mock";
+import { getServerAdapter } from "@/lib/mock/server";
 import { DigestFeed } from "@/components/digests/digest-feed";
 import { SectionHeader } from "@/components/section-header";
 
 export const metadata = { title: "Digests" };
 
+// Live data (DB + Google Calendar) must be fetched fresh per request, never
+// baked in at build time — see lib/mock/server.ts.
+export const dynamic = "force-dynamic";
+
 export default async function DigestsPage() {
+  const adapter = getServerAdapter();
   const [digests, settings] = await Promise.all([
-    dataAdapter.getDigests(),
-    dataAdapter.getSettings(),
+    adapter.getDigests(),
+    adapter.getSettings(),
   ]);
 
   return (

@@ -1,14 +1,19 @@
-import { dataAdapter } from "@/lib/mock";
+import { getServerAdapter } from "@/lib/mock/server";
 import { ActivityFeed } from "@/components/activity/activity-feed";
 import { SectionHeader } from "@/components/section-header";
 
 export const metadata = { title: "Activity" };
 
+// Live data (DB + Google Calendar) must be fetched fresh per request, never
+// baked in at build time — see lib/mock/server.ts.
+export const dynamic = "force-dynamic";
+
 export default async function ActivityPage() {
+  const adapter = getServerAdapter();
   const [activity, members, settings] = await Promise.all([
-    dataAdapter.getActivity(),
-    dataAdapter.getFamilyMembers(),
-    dataAdapter.getSettings(),
+    adapter.getActivity(),
+    adapter.getFamilyMembers(),
+    adapter.getSettings(),
   ]);
 
   return (
