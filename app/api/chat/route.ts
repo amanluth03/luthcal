@@ -95,7 +95,17 @@ export async function POST(request: Request) {
   const normalizedMessages: RunAgentMessage[] = [...messages.slice(0, -1), { role: "user", content: normalized.text }];
 
   try {
-    const result = await runAgent({ messages: normalizedMessages, source: "dashboard" });
+    // BUG 1 fix (docs/agent-core.md): pass the signed-in user's email as
+    // senderHandle so the inbound message_log row isn't sender-less. runAgent
+    // resolves it to a family_members.id when it matches (e.g. against
+    // imessageHandle, which doubles as an email field); otherwise the raw
+    // email itself is stored, so the dashboard activity feed shows "Aman" or
+    // at minimum "aman@..." — never "Unknown".
+    const result = await runAgent({
+      messages: normalizedMessages,
+      source: "dashboard",
+      senderHandle: session.user?.email ?? undefined,
+    });
     return Response.json(result);
   } catch (err) {
     console.error("[api/chat] runAgent failed", err);

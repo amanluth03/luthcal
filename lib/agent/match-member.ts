@@ -14,6 +14,14 @@ export interface RosterMember {
   id: string;
   name: string;
   aliases: string[];
+  /**
+   * Optional — populated by lib/agent/index.ts's getFamilyRoster and used by
+   * lib/agent/resolve-sender.ts's resolveSenderMemberId to identify WHO SENT
+   * a message (as opposed to this file's matchMember, which resolves a name
+   * mentioned IN a message's text). Not used by matchMember itself.
+   */
+  imessageHandle?: string | null;
+  phone?: string | null;
 }
 
 export type MatchResult =

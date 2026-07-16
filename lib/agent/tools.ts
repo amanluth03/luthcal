@@ -2,6 +2,7 @@ import { tool } from "ai";
 import { z } from "zod";
 
 import { checkConflicts as gCheckConflicts } from "@/lib/google/conflicts";
+import { findNearDuplicateEvent } from "@/lib/google/duplicates";
 import {
   createEvent as gCreateEvent,
   deleteEvent as gDeleteEvent,
@@ -98,7 +99,7 @@ export function buildAgentTools(ctx: AgentToolContext) {
   return {
     createEvent: tool({
       description:
-        "Create a new event on the shared family calendar. After calling this for an event with assigned members, call checkConflicts for the same time range and members, and mention any conflicts in your reply.",
+        "Create a new event on the shared family calendar. First checks for a near-identical event that already exists (same title, overlapping time, same family member(s)) — if one is found, NOTHING is created and the result includes duplicateFound instead of event; ask the user to confirm before calling this again with confirmDuplicate: true. After actually creating an event with assigned members, call checkConflicts for the same time range and members, and mention any conflicts in your reply.",
       inputSchema: z.object({
         title: z.string().describe("Short event title, e.g. 'Maya - dentist'."),
         startISO: isoDateTime,
@@ -107,8 +108,14 @@ export function buildAgentTools(ctx: AgentToolContext) {
         memberNames: z.array(z.string()).describe(memberNamesDescription),
         notes: z.string().optional(),
         location: z.string().optional(),
+        confirmDuplicate: z
+          .boolean()
+          .optional()
+          .describe(
+            "Only set true after the user has explicitly confirmed they want to add this event even though an identical-looking one already exists (i.e. you already asked and they said yes to a second one). Omit/false on a normal call — the tool checks for a near-duplicate itself and will tell you via duplicateFound if it finds one, rather than silently creating a copy.",
+          ),
       }),
-      execute: async ({ title, startISO, endISO, allDay, memberNames, notes, location }) => {
+      execute: async ({ title, startISO, endISO, allDay, memberNames, notes, location, confirmDuplicate }) => {
         const resolved = resolveMemberNames(memberNames, ctx.roster);
         if ("ambiguousName" in resolved) {
           return {
@@ -117,6 +124,27 @@ export function buildAgentTools(ctx: AgentToolContext) {
               candidates: resolved.candidates.map((c) => ({ id: c.id, name: c.name })),
             },
           };
+        }
+
+        if (!confirmDuplicate) {
+          const duplicate = await findNearDuplicateEvent({
+            title,
+            startISO,
+            endISO,
+            allDay,
+            memberIds: resolved.memberIds,
+          });
+          if (duplicate) {
+            return {
+              duplicateFound: {
+                googleEventId: duplicate.id,
+                title: duplicate.title,
+                start: duplicate.start,
+                end: duplicate.end,
+                allDay: duplicate.allDay,
+              },
+            };
+          }
         }
 
         const event = await gCreateEvent({

@@ -204,7 +204,8 @@ route. Covered by `tests/inbound/malformed-text.test.ts`.
 ### 2b. `/api/chat` request/response contract
 
 `app/api/chat/route.ts` is the dashboard's entry point into the same
-`runAgent` the iMessage webhook will use. Full contract (mirrored as a
+`runAgent` the iMessage webhook (`app/api/webhooks/bluebubbles/route.ts`,
+backend-dev's, now landed) also drives. Full contract (mirrored as a
 comment block at the top of the route file itself):
 
 **Request** — `POST /api/chat`
@@ -246,9 +247,155 @@ comment block at the top of the route file itself):
   empty/whitespace-only or over `MAX_INBOUND_LENGTH`.
 - `500` — `runAgent` threw (upstream model/tool failure).
 
-**Auth:** still `TODO(production)` — no guard today, fine for local
-dashboard use against `next dev`; needs the same `FAMILY_PASSCODE` check the
-rest of the dashboard uses before this is reachable in production (see §8).
+**Auth:** `auth.ts`'s Google-sign-in + `FAMILY_EMAILS` allowlist now gates
+this route (session check at the top of the handler; also re-checked here as
+defense in depth even though `proxy.ts`'s matcher already covers it) — the
+`TODO(production)` noted in an earlier draft of this doc has landed. The
+signed-in session's email is also what BUG 1 (§2c below) uses as
+`runAgent`'s `senderHandle`.
+
+### 2c. Sender identity → `message_log.member_id` (BUG 1)
+
+**Root cause:** `app/api/chat/route.ts` called `runAgent({ messages, source:
+"dashboard" })` with no identity at all, so every dashboard-created event's
+inbound `message_log` row had both `sender_handle` and `member_id` null.
+`lib/data/server-adapter.ts`'s `resolveActivitySender` has no fallback for
+that combination beyond `"Unknown"` — hence the activity feed showing
+"Unknown" for every dashboard-originated action.
+
+Fix, in two parts:
+
+- `app/api/chat/route.ts` now extracts the signed-in user's email from
+  `auth()`'s session and passes it through `runAgent`'s existing
+  `senderHandle` param: `senderHandle: session.user?.email ?? undefined`.
+  **Design call: reused `senderHandle` rather than adding a separate
+  `actorEmail`/`actorMemberId` field.** `senderHandle` already means
+  "whatever identifier the inbound message's sender is known by" — an
+  iMessage phone/Apple-ID email for `source: "imessage"`; a dashboard user's
+  Google-sign-in email fits the same semantics without forking the
+  parameter, and keeps `lib/agent/index.ts`'s `logMessage` / `message_log`
+  writing path identical for both channels. `RunAgentParams.senderHandle`'s
+  doc comment is updated to say this explicitly, so it doesn't read as
+  iMessage-only to a future reader (or to whoever wires the BlueBubbles side
+  further).
+- `lib/agent/resolve-sender.ts` (new file) exports `resolveSenderMemberId
+  (senderHandle, roster)` — a pure, non-LLM, exact (trimmed,
+  case-insensitive) match against each roster member's `imessageHandle` or
+  `phone`. This is a DIFFERENT lookup from `lib/agent/match-member.ts`'s
+  `matchMember`: that resolves a name mentioned *in* a message's text
+  ("create an event for Maya") to a member; this resolves *who sent* the
+  message. `family_members` has no dedicated `email` column — the schema
+  question flagged in the task brief — so this reuses `imessageHandle`,
+  which already doubles as an email/Apple-ID field for some members (see
+  `scripts/seed.ts`: Aman's row stores `amanluth03@gmail.com` there) rather
+  than adding a new column for what's fundamentally the same "how do we
+  reach this person" concept.
+- `runAgent` (`lib/agent/index.ts`) now fetches the roster before logging
+  the inbound message (reordered — see the BUG 2 write-up below, which needs
+  the same reordering for its own reason), resolves `senderHandle` against
+  it, and passes the result through `logMessage`'s new `memberId` param into
+  `message_log.member_id`. `getFamilyRoster`'s query was extended to also
+  select `imessageHandle`/`phone` (previously just `id`/`name`/`aliases`) —
+  never rendered into the system prompt (`formatRoster` is unchanged and
+  still only shows name/aliases), so there's no prompt-hygiene concern from
+  fetching them.
+- **When the email doesn't map to any roster member** (not yet added to
+  `family_members`, or a `FAMILY_EMAILS`-allowlisted address without a
+  matching row), `member_id` stays null but `sender_handle` is still the raw
+  email — `resolveActivitySender` already falls back to `sender_handle`
+  before `"Unknown"`, so the activity feed shows the email rather than
+  "Unknown" either way. Per the task brief: "if the signed-in email doesn't
+  map to a member, store the email as sender_handle so the activity shows
+  the email rather than Unknown."
+
+**Net result:** an event Aman creates via the dashboard now shows "Aman" in
+the activity feed (his seeded `imessageHandle` is his Gmail address, so it
+resolves to his `family_members` row). A signed-in family member not yet in
+`family_members` sees their raw email instead of "Unknown" — a real
+improvement, and a visible prompt to go add them to the roster.
+
+Tests: `tests/agent/resolve-sender.test.ts`.
+
+### 2d. Level-1 conversation memory (BUG 2)
+
+**Root cause:** `/api/chat` was stateless server-side — `runAgent` never
+read back `message_log` — and relied entirely on the caller resending full
+history in `messages` every request. That degrades gracefully on the
+dashboard (a page reload just loses history) but is a hard blocker over
+iMessage: `app/api/webhooks/bluebubbles/route.ts` (backend-dev's, now
+landed) passes only the single just-received message every time, and its
+own comment flags exactly this gap: *"runAgent has no multi-turn context
+beyond what's passed in `messages` — wiring in recent message_log rows as
+prior turns... noted as a reasonable v2 rather than built speculatively."*
+This is that v2, built inside `runAgent` itself so both callers get it for
+free without either webhook route changing (out of scope for this pass
+anyway — see the top-level boundaries).
+
+New file `lib/agent/history.ts`:
+
+- **`loadRecentThreadHistory(chatGuid, roster)`** — queries `message_log`
+  and returns `ModelMessage[]`.
+  - **Scope:** `chatGuid` set (source `"imessage"`) → that one group chat's
+    rows only (`eq(messageLog.chatGuid, chatGuid)`). `chatGuid` undefined
+    (source `"dashboard"`) → every row with a **NULL** `chat_guid`
+    (`isNull(messageLog.chatGuid)`) — there's one family and no server-side
+    dashboard session/thread id, so "every dashboard-origin message" is the
+    only sensible single thread, per the task brief's own suggestion. The
+    two scopes never cross-contaminate: iMessage rows always carry a
+    `chatGuid` (enforced upstream by the webhook), dashboard rows never do.
+  - **Window:** last `HISTORY_MESSAGE_LIMIT` = 20 rows for the thread,
+    further restricted to the last `HISTORY_MAX_AGE_MS` = 24 hours. The two
+    bounds are independent: the count cap guards against a prompt-bloating
+    burst of back-and-forth in one sitting; the age cap guards against a
+    week-old conversation silently resurfacing just because the thread's
+    been quiet since. Both are conservative, documented constants — tune if
+    real usage says otherwise.
+  - **Attribution:** inbound rows are prefixed `"Name: text"` (resolved via
+    `memberId`/roster, falling back to the raw `senderHandle`) — but ONLY
+    when `chatGuid` is set. An iMessage group chat has multiple real
+    senders and the model needs to track who said what across turns (the
+    exact gap the bluebubbles route's own comment flagged); the dashboard is
+    effectively single-sender (one signed-in session at a time) and,
+    critically, prefixing dashboard history would make it byte-for-byte
+    different from what the dashboard client resends verbatim every request
+    — breaking the dedup below. This is a deliberate asymmetry, not an
+    oversight.
+  - **Degrades to `[]`, never throws**, if `getDb()`/`DATABASE_URL` is
+    unavailable — same pattern as `getFamilyRoster`, so `next build` and any
+    DB-less environment keep working.
+- **`dedupeHistory(history, callerMessages)`** — drops any loaded-history
+  message whose `(role, content)` already appears verbatim in the
+  caller-supplied `messages`. Necessary because the dashboard client still
+  resends its own full history every request (unchanged, §2b) — without
+  this, prepending DB history on top would double every turn except the
+  newest one. Exact-string match, not fuzzy: a rare false-negative (an
+  occasional literal repeat like "yes" surviving in both places) just costs
+  a few duplicate tokens; a false-positive would drop a real, distinct turn.
+  For iMessage, the caller only ever sends the single current-turn message,
+  so there's nothing to dedupe against — all loaded history passes straight
+  through.
+
+`runAgent` wiring (`lib/agent/index.ts`): loads `history` *before* logging
+the current turn's inbound message, so the turn being submitted right now
+can never be pulled back in as its own history. Final model input is
+`coalesceConsecutiveRoles([...dedupeHistory(history, messages),
+...callerModelMessages])`. `coalesceConsecutiveRoles` is a small defensive
+addition: `dedupeHistory` filters individual messages rather than always
+removing a contiguous block, so in principle it could leave two same-role
+messages adjacent (a short, generic message coinciding with something in
+the caller's array). Some model providers enforce strict user/assistant
+alternation, so adjacent same-role messages are merged (content joined with
+a newline) as a safety net — a no-op in the normal case where history and
+caller messages already alternate correctly.
+
+**Explicitly Level-1 only:** this is recent-conversational-turns memory, not
+long-term fact memory ("Kai is allergic to peanuts" persisting across
+unrelated conversations weeks later, independent of the 24h/20-message
+window above). Level-2 long-term facts is a separate, deliberately deferred
+future task — not started here.
+
+Tests: `tests/agent/history.test.ts` (scope, window, ordering, attribution,
+DB-unavailable degradation, and the `dedupeHistory` merge cases).
 
 ## 3. Announcement / digest / reminder triggers
 
@@ -351,6 +498,72 @@ member-specific OAuth grant — a materially bigger change).
 now agree on every case including all-day-vs-all-day. Swapping the mock adapter
 for the real one won't change conflict-highlighting behavior.
 
+### 4a. Duplicate-event guard (BUG 3)
+
+**Root cause:** a user re-asked for an event because it hadn't synced to
+their phone yet (Apple Calendar lag), and the agent created a second,
+identical event with no warning. `checkConflicts` only ever produces a
+⚠️-warn-but-still-create result — it was never asked to distinguish "this is
+probably the same event, asked twice" from "this is a genuinely different
+event that merely overlaps."
+
+New file `lib/google/duplicates.ts`, `findNearDuplicateEvent(candidate)` —
+read-only, built on top of `checkConflicts` as a prefilter (same
+shared-calendar-only, shared-member, same-kind, overlapping-time query)
+rather than reimplementing event fetching.
+
+**"Near-identical" — precise definition** (deliberately strict, so this
+never blocks a genuinely different event that merely overlaps in time — that
+case is untouched and still goes through the existing
+⚠️-warn-but-still-create path):
+
+1. **Same normalized title** — trimmed, internal whitespace collapsed,
+   case-insensitive. Exact match, not fuzzy/substring — same reasoning as
+   `matchMember`'s no-fuzzy-matching rule (§2): a confident wrong guess is
+   worse than occasionally missing a duplicate that happened to be phrased
+   differently.
+2. **Same *set* of `memberIds`**, not merely overlapping. "Maya's dentist"
+   followed by "Maya and Kai's dentist" is a distinct event, not a
+   duplicate, even with an identical title/time — checked in addition to
+   (and stricter than) `checkConflicts`'s own ≥1-shared-member prefilter.
+3. **Overlapping time range, same all-day-ness** — literally
+   `checkConflicts`'s own overlap rule, reused as-is. Two events with an
+   identical start/end trivially satisfy this, which is what the actual
+   production bug looks like (the same text, sent twice, resolves to the
+   same ISO times both times) — no separate fuzzy time-window was needed on
+   top of it.
+
+**Known limitation, inherited from `checkConflicts`:** its prefilter
+requires ≥1 shared member, so two completely untagged (`memberIds: []`)
+events are never flagged as duplicates of each other — not a new limitation
+introduced here, the same one conflict-detection already has (above).
+
+**Wiring** (`lib/agent/tools.ts`): `createEvent`'s `execute()` calls
+`findNearDuplicateEvent` after member-name resolution but before the Google
+Calendar write, whenever the new `confirmDuplicate` param isn't `true`. If a
+near-duplicate is found, **nothing is created** — the tool returns
+`{ duplicateFound: { googleEventId, title, start, end, allDay } }` instead
+of `{ event }`. The model must explicitly re-call `createEvent` with
+`confirmDuplicate: true` after the user confirms they want a second event —
+there's no other way to bypass the check, and the system prompt (§2, rule 3)
+tells the model to ask first and not assume yes.
+
+**Interaction with the other two bugs in this pass:** independent of BUG 1.
+Runs inside the tool's `execute()`, upstream of `surfaceConflictWarnings`
+(which only ever reads `action.output.event`; a blocked duplicate's output
+has no `event` key, so it's silently skipped there — the same short-circuit
+shape as the existing `ambiguousMember` case). BUG 2's conversation memory
+is what makes the "ask, then create on confirmation" flow actually work in
+practice over iMessage: without prior-turn context, a follow-up "yes, add it
+anyway" wouldn't have anything to resolve against.
+
+**Deliberately out of scope:** `updateEvent` — moving/editing an existing
+event can't create a duplicate of itself. A v2 idea (e.g. warning if an
+update's new time/title now collides with an unrelated existing event), not
+built here.
+
+Tests: `tests/google/duplicates.test.ts`.
+
 ## 5. Data model
 
 No schema changes were needed. `event_meta` (already in
@@ -412,21 +625,23 @@ rather than a new table.
 
 ## 8. Production TODOs (explicitly not built here)
 
-- `app/api/chat/route.ts` has no auth guard (fine for local dashboard use;
-  needs the same `FAMILY_PASSCODE` check the rest of the dashboard uses
-  before this is reachable in production).
 - `app/api/webhooks/google/route.ts` has a TODO to kick the announce sweep
   directly after a successful sync, instead of waiting for backend-dev's
   cron tick — left as a hook, not wired, since the cron doesn't exist yet.
-- `message_log.member_id` is never populated by `runAgent` (no
-  handle-to-`family_members.id` resolution happens here) — left `null`.
-  Note this is a different lookup than F4's `matchMember` (that resolves
-  *name text mentioned in a message* to a member; this would resolve the
-  *iMessage handle that sent it* to a member, e.g. matching
-  `family_members.imessageHandle`/`.phone` against `senderHandle`) — not the
-  same function, though `family_members` is the same table. Whichever
-  webhook resolves `senderHandle` can pass a resolved `memberId` through if
-  that turns out to be worth wiring up.
+- ~~`message_log.member_id` is never populated by `runAgent`~~ — **resolved,
+  see §2c (BUG 1):** `runAgent` now resolves `senderHandle` to a
+  `family_members.id` via `lib/agent/resolve-sender.ts`'s
+  `resolveSenderMemberId` and passes it through to `message_log.member_id`
+  when it matches. One narrowing worth flagging for tech-lead: this only
+  resolves the identity the *caller* passes as `senderHandle` — for
+  `source: "imessage"`, that's whatever `app/api/webhooks/bluebubbles/
+  route.ts` extracts as `data.handle?.address` and passes straight through;
+  `runAgent` doesn't second-guess it. If BlueBubbles ever reports a handle
+  in a different format than what's stored in `family_members.imessageHandle`
+  (e.g. a phone number normalized differently), resolution silently misses
+  rather than erroring — same fail-open-to-null behavior as an unmapped
+  dashboard email (§2c), just worth confirming against a live BlueBubbles
+  payload during setup.
 - F4's member-matching backstop (§2) only covers `createEvent`/`updateEvent`.
   `checkConflicts` still takes `memberIds` directly from the model — it's
   read-only, so the failure mode of a bad id there is a wrong/missed

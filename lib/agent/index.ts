@@ -6,7 +6,9 @@ import { familyMembers, messageLog } from "@/lib/db/schema";
 import { checkConflicts } from "@/lib/google/conflicts";
 import { formatNowForPrompt, getFamilyTimeZone } from "@/lib/google/time";
 import type { LuthEvent } from "@/lib/google/types";
+import { dedupeHistory, loadRecentThreadHistory } from "./history";
 import type { RosterMember } from "./match-member";
+import { resolveSenderMemberId } from "./resolve-sender";
 import { buildAgentTools, type AgentSource } from "./tools";
 
 // Model is addressed via a Vercel AI Gateway string, resolved by the
@@ -36,9 +38,17 @@ export interface AgentAction {
 export interface RunAgentParams {
   messages: RunAgentMessage[];
   source: AgentSource;
-  /** iMessage group chat GUID this run is attached to (source "imessage"). Used for logging and as the sendGroupMessage destination. */
+  /** iMessage group chat GUID this run is attached to (source "imessage"). Used for logging, as the sendGroupMessage destination, and (BUG 2) to scope conversation history to this thread. */
   chatGuid?: string;
-  /** The iMessage handle (phone/email) that sent the inbound text, for message_log. */
+  /**
+   * Identifies who sent the inbound message — an iMessage handle
+   * (phone/Apple ID email) for source "imessage", or the signed-in
+   * dashboard user's Google account email for source "dashboard" (see
+   * app/api/chat/route.ts). Logged verbatim to message_log.sender_handle,
+   * and (BUG 1, see resolveSenderMemberId in ./resolve-sender.ts) resolved
+   * to message_log.member_id when it matches a family_members row, so the
+   * dashboard activity feed can show a real name instead of "Unknown".
+   */
   senderHandle?: string;
 }
 
@@ -54,7 +64,20 @@ export interface RunAgentResult {
 async function getFamilyRoster(): Promise<RosterMember[]> {
   try {
     const db = getDb();
-    return await db.select({ id: familyMembers.id, name: familyMembers.name, aliases: familyMembers.aliases }).from(familyMembers);
+    // imessageHandle/phone are fetched here too (not just id/name/aliases)
+    // so this single roster snapshot can also back BUG 1's
+    // resolveSenderMemberId and BUG 2's sender-attributed history, without
+    // a second DB round trip. They're never shown to the model (formatRoster
+    // below only renders name/aliases) — no prompt-hygiene concern.
+    return await db
+      .select({
+        id: familyMembers.id,
+        name: familyMembers.name,
+        aliases: familyMembers.aliases,
+        imessageHandle: familyMembers.imessageHandle,
+        phone: familyMembers.phone,
+      })
+      .from(familyMembers);
   } catch (err) {
     // No DB configured, or a transient failure — degrade to an empty roster
     // rather than failing the whole request. The agent's instructions tell
@@ -88,11 +111,13 @@ ${formatRoster(roster)}
 How to operate:
 1. Parse who the event is for, what it is, and when. When calling createEvent/updateEvent, pass memberNames as the name/alias text you read in the conversation (e.g. "Maya", "mom") — do NOT resolve those names to ids yourself; that's done deterministically, outside your control, against the roster above. The read-only tools are the one exception: checkConflicts and listEvents take member *ids*, not names — use the \`id:\` values shown in the roster above for those.
 2. If createEvent/updateEvent returns an ambiguousMember result instead of a created/updated event, the name you gave matched more than one family member (listed in candidates). Do not retry with a guess — ask the user which person they meant, then call the tool again once they've told you. If instead it returns unresolvedMemberNames alongside a created/updated event, those names matched nobody on the roster and were left off the event — briefly note that in your reply (e.g. "I didn't recognize 'Emma' as a family member, so I didn't tag anyone") so a typo or a missing roster entry gets caught, but don't block on it.
-3. If the family member or the time is genuinely ambiguous in the conversation itself (e.g. a date phrase has two reasonable readings), ask a short clarifying question instead of guessing. Don't ask about things that are reasonably inferable — pick something sensible for an unstated detail (like a default evening time for "dinner") and say what you picked.
-4. After creating or moving an event that has assigned family members, always call checkConflicts for that event's members and time range, and mention any conflicts in your reply, prefixed with a warning emoji (⚠️).
-5. Use listEvents to find an event's googleEventId (e.g. from context earlier in the conversation, or by asking what it's called and searching a reasonable window) before calling updateEvent or deleteEvent.
-6. Keep replies short and warm — they're going into a family group text, not a confirmation email. One or two sentences is usually enough.
-7. Only use sendGroupMessage for a message beyond your normal reply — your normal reply already reaches the chat, so don't send it twice.`;
+3. If createEvent returns a duplicateFound result instead of a created event, NOTHING was created — an event with the same title, an overlapping time, and the same family member(s) already exists (shown in duplicateFound). Tell the user about the existing event and ask whether they really want a separate, second one; do not assume yes. Only call createEvent again with confirmDuplicate: true if they explicitly confirm they want a second event. If they meant the existing one (e.g. it just hadn't shown up on their phone yet), reassure them it's already there instead.
+4. If the family member or the time is genuinely ambiguous in the conversation itself (e.g. a date phrase has two reasonable readings), ask a short clarifying question instead of guessing. Don't ask about things that are reasonably inferable — pick something sensible for an unstated detail (like a default evening time for "dinner") and say what you picked.
+5. After creating or moving an event that has assigned family members, always call checkConflicts for that event's members and time range, and mention any conflicts in your reply, prefixed with a warning emoji (⚠️).
+6. Use listEvents to find an event's googleEventId (e.g. from context earlier in the conversation, or by asking what it's called and searching a reasonable window) before calling updateEvent or deleteEvent.
+7. Keep replies short and warm — they're going into a family group text, not a confirmation email. One or two sentences is usually enough.
+8. Only use sendGroupMessage for a message beyond your normal reply — your normal reply already reaches the chat, so don't send it twice.
+9. Earlier turns from message_log may appear above this instruction as prior conversation context, some possibly prefixed with "Name: " to show who said it in a group chat — treat them as real conversation history (e.g. resolving "make it 4 instead" against an event discussed a few turns ago), not as something to repeat back or comment on.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +126,7 @@ How to operate:
 
 async function logMessage(
   direction: "inbound" | "outbound",
-  opts: { chatGuid?: string; senderHandle?: string; text: string },
+  opts: { chatGuid?: string; senderHandle?: string; memberId?: string; text: string },
 ): Promise<void> {
   try {
     const db = getDb();
@@ -109,6 +134,7 @@ async function logMessage(
       direction,
       chatGuid: opts.chatGuid,
       senderHandle: opts.senderHandle,
+      memberId: opts.memberId,
       text: opts.text,
     });
   } catch (err) {
@@ -132,6 +158,31 @@ function extractActions(steps: ReadonlyArray<{
     }
   }
   return actions;
+}
+
+/**
+ * Merges consecutive same-role messages into one (content joined with a
+ * newline). Defensive guard for BUG 2's history/caller merge: `dedupeHistory`
+ * removes individual matching messages rather than a contiguous block, so in
+ * a rare edge case (a short, generic message like "ok" repeated verbatim
+ * across turns matching something in the caller's own array) it could leave
+ * two same-role messages adjacent in the final array. Some model providers
+ * (Anthropic's Messages API among them) require strict user/assistant
+ * alternation, so this keeps the merged array valid regardless of how that
+ * edge case shakes out — a no-op in the normal case, where history and
+ * caller messages already alternate correctly.
+ */
+function coalesceConsecutiveRoles(msgs: ModelMessage[]): ModelMessage[] {
+  const out: ModelMessage[] = [];
+  for (const msg of msgs) {
+    const prev = out[out.length - 1];
+    if (prev && prev.role === msg.role && typeof prev.content === "string" && typeof msg.content === "string") {
+      prev.content = `${prev.content}\n${msg.content}`;
+    } else {
+      out.push({ ...msg });
+    }
+  }
+  return out;
 }
 
 /**
@@ -174,23 +225,43 @@ async function surfaceConflictWarnings(actions: AgentAction[]): Promise<string[]
 // ---------------------------------------------------------------------------
 
 export async function runAgent({ messages, source, chatGuid, senderHandle }: RunAgentParams): Promise<RunAgentResult> {
+  // Fetched once and reused for the prompt, the tools, AND (BUG 1/BUG 2
+  // below) sender/history resolution, so createEvent/updateEvent's
+  // memberNames resolution (see lib/agent/tools.ts resolveMemberNames) is
+  // guaranteed to run against the exact same roster snapshot the model was
+  // shown, not a second query that could race a concurrent roster edit.
+  const roster = await getFamilyRoster();
+
+  // BUG 2 — Level-1 conversation memory: load this thread's recent history
+  // BEFORE logging the current turn below, so the turn being submitted right
+  // now is never pulled back in as its own "history". See lib/agent/history.ts
+  // and docs/agent-core.md for scope/window/dedup details.
+  const history = await loadRecentThreadHistory(chatGuid, roster);
+
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (lastUserMessage) {
-    await logMessage("inbound", { chatGuid, senderHandle, text: lastUserMessage.content });
+    // BUG 1 — resolve senderHandle (iMessage handle, or the dashboard
+    // user's session email) to a family_members.id when it matches, so the
+    // activity feed can show a real name instead of "Unknown". Falls back
+    // to leaving member_id null (senderHandle is still stored, so the
+    // activity feed shows the raw handle/email rather than "Unknown") when
+    // it doesn't match anyone on the roster.
+    const memberId = resolveSenderMemberId(senderHandle, roster);
+    await logMessage("inbound", { chatGuid, senderHandle, memberId, text: lastUserMessage.content });
   }
 
-  // Fetched once and reused for both the prompt and the tools, so
-  // createEvent/updateEvent's memberNames resolution (see
-  // lib/agent/tools.ts resolveMemberNames) is guaranteed to run against the
-  // exact same roster snapshot the model was shown, not a second query that
-  // could race a concurrent roster edit.
-  const roster = await getFamilyRoster();
   const system = buildSystemPrompt(source, roster);
   const tools = buildAgentTools({ source, chatGuid, roster });
 
-  const modelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
+  const callerModelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
     m.role === "user" ? { role: "user", content: m.content } : { role: "assistant", content: m.content },
   );
+  // Deduped DB history first (oldest), then the caller's own messages (which
+  // for the dashboard already include resent history — dedupeHistory drops
+  // whatever overlaps so it isn't doubled; for iMessage this is just the
+  // single current turn, so nothing to dedupe against). coalesceConsecutiveRoles
+  // guards against the merge ever violating strict user/assistant alternation.
+  const modelMessages: ModelMessage[] = coalesceConsecutiveRoles([...dedupeHistory(history, messages), ...callerModelMessages]);
 
   const result = await generateText({
     model: MODEL,
