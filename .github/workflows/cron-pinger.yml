@@ -1,86 +1,73 @@
 name: Cron pinger
 
-# LuthCal is on Vercel Hobby, which caps Vercel Cron at 1 invocation/day per
-# job (see vercel.json + docs/bluebubbles-setup.md "Frequency note"). The
-# reminder sweep, announce sweep, and outbound-queue retry all need to run
-# every 5-15 minutes to be useful, so this workflow pings their cron
-# endpoints on GitHub Actions' scheduler instead. Full rationale, cadence,
-# and the Hobby-vs-Pro tradeoff are documented in docs/cron-pinger.md.
+# LuthCal deploys on Vercel Hobby, which REJECTS a deployment whose vercel.json
+# declares any sub-daily cron (and caps cron jobs hard). So vercel.json carries
+# NO crons, and this workflow drives ALL of LuthCal's scheduled work on GitHub
+# Actions' scheduler by pinging the /api/cron/* endpoints. Which endpoints fire
+# is decided by which `schedule:` entry triggered the run (github.event.schedule).
 #
-# The daily/weekly digest and the once-daily watch-channel renewal are left
-# to Vercel's own cron (vercel.json) — they only need to fire once a day,
-# which Hobby supports natively, so pinging them here too would be
-# redundant. See docs/cron-pinger.md for the reasoning.
-#
-# GitHub Actions `schedule:` triggers are best-effort, not exact — GitHub
-# explicitly documents that scheduled runs can be delayed (more so during
-# periods of high load) and have a practical minimum granularity around 5
-# minutes. This is an accepted tradeoff of the external-pinger strategy, not
-# a bug: a reminder or announcement landing a few minutes late is fine for a
-# family calendar.
+# GitHub Actions `schedule:` is best-effort, not exact — runs can be delayed
+# (more so under load) and have a ~5-minute floor. A reminder or digest landing
+# a few minutes late is fine for a family calendar. Times below are UTC; the
+# intended local times assume America/Chicago (FAMILY_TZ).
 #
 # Required repo secrets (Settings > Secrets and variables > Actions):
-#   APP_BASE_URL  - the deployed app's public https URL, e.g.
-#                   https://luthcal.vercel.app (no trailing slash)
-#   CRON_SECRET   - same value as the Vercel env var of the same name; sent
-#                   as `Authorization: Bearer <CRON_SECRET>`, exactly what
-#                   Vercel Cron itself sends (see lib/webhook-auth.ts
-#                   isValidCronRequest)
+#   APP_BASE_URL  - deployed https URL, e.g. https://luthcal.vercel.app (no trailing slash)
+#   CRON_SECRET   - same value as the Vercel env var; sent as `Authorization: Bearer <CRON_SECRET>`
+# Full rationale + cadence in docs/cron-pinger.md.
 
 on:
   schedule:
-    # Every 10 minutes, all day. Comfortably above GitHub's ~5 min floor and
-    # inside both the reminders/announce cadence (*/15 in vercel.json's own
-    # schedule) and the outbound retry cadence (*/5) documented for Vercel
-    # Cron — see docs/cron-pinger.md for why 10 min was chosen as the single
-    # shared cadence for all three sub-daily endpoints on Hobby.
-    - cron: "*/10 * * * *"
-  # Lets a maintainer trigger a manual run from the Actions tab — e.g. to
-  # confirm APP_BASE_URL/CRON_SECRET are configured right after first
-  # setting up the repo secrets, without waiting for the next scheduled tick.
+    - cron: "*/10 * * * *" # every 10 min: reminders + announce + outbound-queue retry
+    - cron: "0 12 * * *"   # ~07:00 America/Chicago daily: daily digest
+    - cron: "0 23 * * 0"   # ~18:00 America/Chicago Sunday: weekly (week-ahead) digest
+    - cron: "30 9 * * *"   # off-peak daily: Google watch-channel renewal
   workflow_dispatch:
 
 concurrency:
-  # Never let two ticks of this workflow overlap. The cron endpoints
-  # themselves are now safe under overlapping calls too (see the
-  # claim-before-send fixes in lib/outbound-processor.ts and
-  # app/api/cron/announce/route.ts), but there's no reason to invite the
-  # race in the first place when GitHub Actions' own scheduler can just
-  # skip a run that's still in flight.
   group: cron-pinger
   cancel-in-progress: false
 
 jobs:
   ping:
-    name: ping sub-daily cron endpoints
+    name: ping scheduled cron endpoints
     runs-on: ubuntu-latest
     env:
       APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      SCHEDULE: ${{ github.event.schedule }}
     steps:
-      - name: Ping reminders, announce, and outbound-queue retry
+      - name: Ping the endpoints for whichever schedule fired
         run: |
           set -u
 
           if [ -z "${APP_BASE_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
             # Not configured yet (expected until the app is deployed and the
-            # APP_BASE_URL/CRON_SECRET repo secrets are set). Skip quietly and
-            # succeed — there is nothing to ping, and a failing scheduled run
-            # here would just email the repo owner every tick. Once the secrets
-            # are set, this guard is skipped and real ping failures fail loudly.
+            # repo secrets are set). Skip quietly and succeed so scheduled runs
+            # don't email the repo owner every tick. Once the secrets exist this
+            # guard is skipped and real ping failures fail loudly.
             echo "::notice::APP_BASE_URL/CRON_SECRET not set yet — skipping ping (see docs/cron-pinger.md)"
             exit 0
           fi
 
           base="${APP_BASE_URL%/}"
-          overall_status=0
 
-          for path in "/api/cron/reminders" "/api/cron/announce" "/api/cron/outbound"; do
+          # Map the triggering schedule to the endpoints it should ping.
+          # workflow_dispatch (manual, empty SCHEDULE) runs the frequent sweeps.
+          case "${SCHEDULE:-}" in
+            "0 12 * * *")   paths="/api/cron/digest?kind=daily" ;;
+            "0 23 * * 0")   paths="/api/cron/digest?kind=weekly" ;;
+            "30 9 * * *")   paths="/api/cron/renew-watch" ;;
+            *)              paths="/api/cron/reminders /api/cron/announce /api/cron/outbound" ;;
+          esac
+
+          overall_status=0
+          for path in $paths; do
             url="${base}${path}"
             echo "Pinging ${path} ..."
 
             http_code=$(curl -sS -o /tmp/cron-pinger-body.txt -w "%{http_code}" \
-              --max-time 30 \
+              --max-time 60 \
               -H "Authorization: Bearer ${CRON_SECRET}" \
               "${url}") || http_code="000"
 
