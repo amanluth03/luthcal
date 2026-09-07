@@ -1045,3 +1045,76 @@ Tests: `tests/agent/history.test.ts`, updated for the new signature and
 extended with an explicit case for `source IS NULL` rows matching neither
 scope, plus new coverage for `loadLastOutboundMessage` (§9's
 pending-confirmation helper, which also depends on this column).
+
+## 12. Shared memory across channels
+
+Full design: `docs/superpowers/specs/2026-09-07-shared-memory-design.md`
+(§1–3 are this module's; §4, the dashboard Memory page under
+`app/(dashboard)`/`components/`, is frontend-design's, built in parallel and
+not touched here). This section is a pointer + summary for review, not a
+restatement — see the spec for the exact reasoning.
+
+**One family thread, not one thread per channel (§1).** `lib/agent/history.ts`
+replaced the old per-channel scope with a single family thread: dashboard
+rows are always in scope; iMessage rows are in scope for the run's own
+family chat (its own `chatGuid` for an iMessage run, `FAMILY_CHAT_GUID` for a
+dashboard run — dashboard-only scope if that's unset). Window widened to the
+last 30 rows / 7 days (`HISTORY_MESSAGE_LIMIT`/`HISTORY_MAX_AGE_MS`). Every
+inbound row is now attributed with the sender's roster name (falling back to
+the raw handle) regardless of channel — previously dashboard rows were left
+unprefixed specifically to avoid breaking the dashboard's resend-dedup; that
+tension is resolved by reordering the pipeline: `loadRecentThreadHistory`
+returns raw rows with metadata (`direction`, `text`, `senderLabel`,
+`source`), `dedupeHistory` dedups against the caller's resent messages on
+that raw text, and only then does the new `formatHistory(rows,
+currentSource)` apply the sender prefix — plus a cross-channel tag
+(`"Vijay (via iMessage): …"` in a dashboard run, `"Aman (via dashboard): …"`
+in an iMessage run) when a row's own channel differs from the current run's.
+`runAgent`'s merge is now
+`coalesceConsecutiveRoles([...formatHistory(dedupeHistory(history,
+messages), source), ...callerModelMessages])`. `loadLastOutboundMessage`
+(the passive-listener pending-confirmation helper, §9) is unchanged.
+
+**Durable memory (§2).** New `lib/agent/memory.ts`, backed by the additive
+`family_memory` table (`lib/db/schema.ts`, already pushed — not touched by
+this pass): `loadActiveMemories()` (active rows, newest first, capped at
+100), `formatMemoriesForPrompt(memories, roster)` (the prompt block, or a
+one-line "nothing remembered yet" when empty), `rememberMemory(input)`
+(inserts, but returns the existing row instead of a second insert when an
+ACTIVE memory already has identical trimmed/case-folded content — an
+archived duplicate doesn't block re-saving it), `forgetMemory(id)` (archives
+via `archived_at`, never a hard delete — mirrors `markAnnounced`/
+`markReminded`'s idempotent-no-op shape), and `searchHistory({ query,
+sinceDays = 90 }, roster)` (family-thread `message_log` rows matching every
+whitespace-separated term via `ILIKE`, newest first, max 20). All five
+degrade gracefully (empty array / no-op, logging the error) when the DB is
+unavailable, same as `getFamilyRoster`.
+
+**Agent wiring (§3).** `buildSystemPrompt` (`lib/agent/index.ts`) takes a new
+`memories` parameter and injects `formatMemoriesForPrompt`'s block under a
+"Things the family has asked you to remember" heading, right after the
+roster; "How to operate" gained three items: save a memory when explicitly
+asked or when a durable preference/pattern/decision is stated to the agent
+(saying "I'll remember that"); don't use it for one-off events or unaddressed
+chatter; use `searchHistory` when someone references conversation older than
+what's shown. `runAgent` loads memories via `loadActiveMemories()` alongside
+the roster. Three new tools in `lib/agent/tools.ts`: `remember` (resolves an
+optional `memberName` through `matchMember`/`resolveMemberNames` exactly like
+an event's member names — same `ambiguousMember`/silently-dropped-`"none"`
+shape) and `forget` are **act-mode only**; `searchHistory` is read-only and
+was added to the passive-listener suggest-mode allowlist alongside
+`listEvents`/`checkConflicts`/`sendGroupMessage`. `AgentToolContext` gained
+`senderMemberId?: string` — `runAgent`'s existing
+`resolveSenderMemberId(senderHandle, roster)` call (§2c) was hoisted out of
+the inbound-`message_log`-write block so the same resolution backs
+`remember`'s `created_by_member_id` without a second lookup.
+
+Tests: `tests/agent/history.test.ts` (family-thread scope for both run
+types, the 30/7-day window, both-channel attribution, the cross-channel tag,
+dedup-on-raw-text) and `tests/agent/memory.test.ts` (prompt formatting
+including the "about"/"from" omission cases, active-only dedup on
+`rememberMemory`, `forgetMemory`'s archive-not-delete and no-op-on-repeat
+behavior, and `searchHistory`'s term-matching/scope/window/labeling), both
+against a fake in-memory `message_log`/`family_memory` following the
+existing fake-query-builder pattern (real drizzle operators, hand-rolled
+in-memory rows).
