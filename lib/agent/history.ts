@@ -47,12 +47,26 @@ function directionToRole(direction: "inbound" | "outbound"): "user" | "assistant
 }
 
 /**
- * The family-thread scope condition: dashboard rows are always in scope;
- * iMessage rows are in scope for the run's own family chat — its own
- * `chatGuid` for an iMessage run, `FAMILY_CHAT_GUID` for a dashboard run
- * (dashboard-only scope if that's unset — there's then no known family chat
- * to fold in). Rows with `source IS NULL` (written before the column
- * existed) match neither branch, so they're simply never pulled back in.
+ * The canonical family thread, independent of any one run's channel/chatGuid:
+ * dashboard rows are always in scope; iMessage rows are in scope for
+ * `FAMILY_CHAT_GUID` (dashboard-only scope if that's unset — there's then no
+ * known family chat to fold in). This is what a dashboard run's own scope
+ * reduces to below, and it's also what `lib/agent/memory.ts`'s
+ * `searchHistory` uses — recall isn't tied to which channel asked for it.
+ */
+export function familyThreadCondition() {
+  const familyChatGuid = process.env.FAMILY_CHAT_GUID;
+  if (!familyChatGuid) return eq(messageLog.source, "dashboard");
+  return or(eq(messageLog.source, "dashboard"), and(eq(messageLog.source, "imessage"), eq(messageLog.chatGuid, familyChatGuid)));
+}
+
+/**
+ * The family-thread scope condition for one run: dashboard rows are always
+ * in scope; iMessage rows are in scope for the run's own family chat — its
+ * own `chatGuid` for an iMessage run, `familyThreadCondition()`'s
+ * `FAMILY_CHAT_GUID`-based scope for a dashboard run. Rows with
+ * `source IS NULL` (written before the column existed) match neither
+ * branch, so they're simply never pulled back in.
  */
 function buildFamilyThreadCondition(source: AgentSource, chatGuid: string | undefined) {
   if (source === "imessage") {
@@ -61,10 +75,7 @@ function buildFamilyThreadCondition(source: AgentSource, chatGuid: string | unde
       : eq(messageLog.source, "imessage");
     return or(eq(messageLog.source, "dashboard"), imessageCondition);
   }
-
-  const familyChatGuid = process.env.FAMILY_CHAT_GUID;
-  if (!familyChatGuid) return eq(messageLog.source, "dashboard");
-  return or(eq(messageLog.source, "dashboard"), and(eq(messageLog.source, "imessage"), eq(messageLog.chatGuid, familyChatGuid)));
+  return familyThreadCondition();
 }
 
 /**
