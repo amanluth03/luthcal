@@ -174,16 +174,11 @@ that request, so LuthCal's webhook auth travels as a query param instead:
    https://<your-luthcal-deployment>.vercel.app/api/webhooks/bluebubbles?secret=<BLUEBUBBLES_WEBHOOK_SECRET>
    ```
    using the same value you set for `BLUEBUBBLES_WEBHOOK_SECRET` in Vercel.
-2. Subscribe to at least the "New Message" event. If BlueBubbles exposes a
-   "Server URL Change" (or similarly-named) event toggle, enable that too —
-   it's how `lib/bluebubbles.ts` learns about a rotated tunnel URL without a
-   redeploy (see §4 step 3). **Note:** the exact event-type string
-   BlueBubbles sends for that case wasn't independently confirmed against
-   live server output while building this (see the comment in
-   `app/api/webhooks/bluebubbles/route.ts`) — if the bridge URL doesn't seem
-   to auto-update after a tunnel restart, check the Vercel function logs for
-   the raw webhook payload's `type` field and adjust
-   `SERVER_URL_CHANGE_TYPES` in that file if it doesn't match.
+2. Subscribe to at least the "New Message" event, and enable "Server URL
+   Change" too — BlueBubbles sends it as a `new-server` event carrying the
+   new public URL, and `app/api/webhooks/bluebubbles/route.ts` stores it
+   (`lib/bluebubbles.ts` `setBridgeUrl`) so sends follow a rotated tunnel
+   URL without a redeploy (see §4 step 3).
 3. `GET /api/webhooks/bluebubbles` returns `ok` (no auth) — use it to
    confirm the deployment is reachable at all before wiring up the webhook.
 
@@ -192,22 +187,12 @@ event above), and ignores `new-message` events where `isFromMe` is true —
 that's the agent's own outbound texts echoing back through the bridge, and
 replying to those would make the agent talk to itself forever.
 
-**Confirm the `isFromMe` field name during setup.** That field name is
-inferred from third-party BlueBubbles integration examples, not
-independently verified against a live server's actual webhook payload (see
-the comment above `SERVER_URL_CHANGE_TYPES` in
-`app/api/webhooks/bluebubbles/route.ts`). If it's wrong, the loop guard
-fails *open* — the agent would reply to its own messages forever. Once the
-webhook is registered, send one test message to the group chat from a
-**real family member's** phone (not the agent's Apple ID) and check the
-Vercel function logs (or add a temporary `console.log(JSON.stringify(payload))`
-at the top of the `POST` handler) for the raw `new-message` payload shape,
-then send one **from the agent's own dedicated Apple ID** (§1) and confirm
-`data.isFromMe` is actually `true` on that one. As a second, independent
-safety net against exactly this kind of drift, the webhook also checks the
-sender handle against `AGENT_IMESSAGE_HANDLE` (case-insensitive) and drops
-the message either way — set that env var (see §5) so the loop guard isn't
-relying on `isFromMe` alone.
+**Loop guard.** `data.isFromMe` is the field BlueBubbles' own
+`MessageSerializer` emits on the agent's outbound sends when they echo back
+through the webhook, so those are dropped before they reach the agent. As a
+second, independent safety net the webhook also drops any message whose
+sender handle matches `AGENT_IMESSAGE_HANDLE` (case-insensitive) — set that
+env var (see §5) so the guard never relies on one field alone.
 
 **Bootstrap the Google Calendar watch channel right after first deploy.**
 `app/api/cron/renew-watch` only runs once daily on Vercel Cron (~3:30-4:30am

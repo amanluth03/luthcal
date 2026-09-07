@@ -7,7 +7,7 @@ import { enqueueOutbound } from "@/lib/agent/outbound";
 import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-inbound";
 import { getDb } from "@/lib/db";
 import { messageLog } from "@/lib/db/schema";
-import { setBridgeUrl } from "@/lib/bluebubbles";
+import { extractServerUrlChange, setBridgeUrl } from "@/lib/bluebubbles";
 import { isValidBlueBubblesWebhookSecret } from "@/lib/webhook-auth";
 
 // Inbound iMessage webhook. BlueBubbles POSTs every server-side event here
@@ -30,31 +30,6 @@ interface NewMessageData {
   isFromMe?: boolean;
   handle?: { address?: string };
   chats?: Array<{ guid?: string }>;
-}
-
-// BlueBubbles' event name for "the server's public URL changed" (its
-// Cloudflare Tunnel/ngrok hostname rotated) — the docs page this was
-// cross-checked against didn't render its full event-type table in this
-// environment (JS-rendered SPA), so this is inferred from the feature's
-// name in the BlueBubbles server UI ("Server URL Change") and its
-// changelog. Worth a one-time confirmation against a live server's actual
-// webhook payload during setup (log the raw body once) — see
-// docs/bluebubbles-setup.md. Unrecognized `type` values are ignored either
-// way, so a wrong guess here just means a URL-rotation event silently
-// no-ops instead of updating the stored bridge URL — not a crash, not a
-// misrouted message.
-const SERVER_URL_CHANGE_TYPES = new Set(["server-url-change", "server-url-changed", "new-server-url"]);
-
-interface ServerUrlChangeData {
-  url?: string;
-  new_url?: string;
-  serverUrl?: string;
-}
-
-function extractServerUrl(data: unknown): string | undefined {
-  const d = data as ServerUrlChangeData | undefined;
-  const candidate = d?.url ?? d?.new_url ?? d?.serverUrl;
-  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
 }
 
 function extractChatGuid(data: NewMessageData): string | undefined {
@@ -87,17 +62,15 @@ export async function POST(request: Request) {
   // The bridge's tunnel URL rotated — persist it so sends (including the
   // outbound-queue retry sweep) target the new address. Not a message event
   // at all, handled first and independently of everything below.
-  if (typeof payload.type === "string" && SERVER_URL_CHANGE_TYPES.has(payload.type)) {
-    const newUrl = extractServerUrl(payload.data);
-    if (newUrl) {
-      after(async () => {
-        try {
-          await setBridgeUrl(newUrl);
-        } catch (err) {
-          console.error("[api/webhooks/bluebubbles] failed to persist new bridge URL", err);
-        }
-      });
-    }
+  const newBridgeUrl = extractServerUrlChange(payload);
+  if (newBridgeUrl) {
+    after(async () => {
+      try {
+        await setBridgeUrl(newBridgeUrl);
+      } catch (err) {
+        console.error("[api/webhooks/bluebubbles] failed to persist new bridge URL", err);
+      }
+    });
     return new Response(null, { status: 200 });
   }
 
@@ -111,21 +84,16 @@ export async function POST(request: Request) {
   const senderHandle = data.handle?.address;
 
   // Critical loop guard: BlueBubbles echoes the agent's own outbound sends
-  // back through this same webhook as `isFromMe: true`. Replying to our own
-  // message would have the agent talk to itself forever.
+  // back through this same webhook as `isFromMe: true` (the field its
+  // MessageSerializer emits). Replying to our own message would have the
+  // agent talk to itself forever.
   if (data.isFromMe) {
     return new Response(null, { status: 200 });
   }
 
-  // F3 (tech-lead follow-up): `isFromMe` is a field name *inferred* from
-  // third-party integration examples, not independently confirmed against a
-  // live BlueBubbles server (see docs/bluebubbles-setup.md) — if it's wrong
-  // or ever renamed upstream, the check above fails OPEN and the agent talks
-  // to itself forever. Defense-in-depth: a second, independent guard that
-  // compares the sender handle against the agent's own dedicated Apple ID
-  // (AGENT_IMESSAGE_HANDLE). Best-effort only (skipped if the env var isn't
-  // set) — this is a belt-and-suspenders backstop for the primary check
-  // above, not itself the sole loop guard.
+  // Second, independent guard: if `isFromMe` were ever renamed upstream the
+  // check above would fail OPEN, so also drop anything sent from the agent's
+  // own Apple ID (AGENT_IMESSAGE_HANDLE). Skipped if the env var isn't set.
   const agentHandle = process.env.AGENT_IMESSAGE_HANDLE;
   if (agentHandle && senderHandle && senderHandle.toLowerCase() === agentHandle.toLowerCase()) {
     return new Response(null, { status: 200 });

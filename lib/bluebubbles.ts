@@ -65,6 +65,24 @@ export async function setBridgeUrl(url: string): Promise<void> {
     .onConflictDoUpdate({ target: settings.key, set: { value: url, updatedAt: new Date() } });
 }
 
+// BlueBubbles reports a rotated public URL as a webhook event of this type
+// with the bare URL string as `data` (bluebubbles-server
+// packages/server/src/server/index.ts: emitMessage(NEW_SERVER, nextConfig.server_address)).
+export const SERVER_URL_CHANGE_EVENT = "new-server";
+
+export function extractServerUrlChange(event: { type?: unknown; data?: unknown }): string | undefined {
+  if (event.type !== SERVER_URL_CHANGE_EVENT || typeof event.data !== "string") return undefined;
+  const candidate = event.data.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+  return candidate;
+}
+
 function getPassword(): string {
   return requireEnv("BLUEBUBBLES_PASSWORD");
 }
