@@ -267,6 +267,22 @@ it's not worth the security trade-off.
    with a `last_error` — likely `BLUEBUBBLES_URL`/`BLUEBUBBLES_PASSWORD`
    wrong, or the Mac/tunnel down).
 
+### 9a. Inbound-poll backstop
+
+BlueBubbles Server runs in a second, dedicated macOS user session on the
+bridge Mac (so the agent's identity from §1 doesn't get tangled up with
+anyone's own Messages.app session) — and macOS aggressively throttles a
+session that's switched away from, to the point that BlueBubbles' own
+message poller can stall for minutes to hours while that session sits in
+the background. Its REST API keeps answering requests fine the whole time,
+though, so `/api/cron/inbound` (`lib/inbound-poll.ts`, pinged every ~10 min
+— see docs/cron-pinger.md) pulls recent messages from that REST API as a
+backstop and runs anything the webhook hasn't already handled through the
+exact same pipeline (`lib/inbound-processor.ts`). Practically: if the group
+chat's group message webhook stops firing when nobody's using the bridge
+Mac's screen, replies should still show up within ~10 minutes via this
+sweep instead of not at all — no action needed on the Mac itself.
+
 ## Cron schedule reference
 
 `vercel.json` holds the authoritative schedules (plain JSON — it can't carry

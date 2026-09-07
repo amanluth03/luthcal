@@ -58,7 +58,7 @@ jobs:
             "0 12 * * *")   paths="/api/cron/digest?kind=daily" ;;
             "0 23 * * 0")   paths="/api/cron/digest?kind=weekly" ;;
             "30 9 * * *")   paths="/api/cron/renew-watch" ;;
-            *)              paths="/api/cron/reminders /api/cron/announce /api/cron/outbound" ;;
+            *)              paths="/api/cron/reminders /api/cron/announce /api/cron/outbound /api/cron/inbound" ;;
           esac
 
           overall_status=0
