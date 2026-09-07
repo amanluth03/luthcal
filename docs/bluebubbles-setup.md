@@ -73,6 +73,26 @@ number during setup** (see §1 and §5) — it does double duty: the loop guard
 that stops the agent from replying to itself, and a second way to address it
 by name.
 
+## 1b. Silent mode (`AGENT_SILENT=true`)
+
+For a bridge Mac that can receive iMessages but can't send them — today
+that's any Mac on macOS 26 without the Private API (§8) — set
+`AGENT_SILENT=true`. The agent still reads the chat and acts on the shared
+calendar (which syncs to everyone's phones), but:
+
+- nothing is queued for the bridge — no replies, digests, reminders, or
+  announcements; the sweeps skip with `AGENT_SILENT`;
+- only an explicit mention engages it (the passive "want me to add that?"
+  path is off, since it can't ask);
+- it never asks clarifying questions — on a genuinely ambiguous request it
+  does nothing and says why in one line;
+- every reply it would have sent is still written to `message_log`, so the
+  dashboard's Activity feed shows what it did and why, and the web app is
+  where corrections happen.
+
+Unset it once the bridge can send (Private API on a dedicated Mac, or a Mac
+on macOS 15).
+
 ## 2. The Mac
 
 BlueBubbles requires a real Mac (Apple's iMessage stack isn't available
@@ -230,8 +250,12 @@ BlueBubbles can send messages two ways, controlled by `BLUEBUBBLES_SEND_METHOD`:
 
 - **`apple-script`** (default): drives Messages.app via AppleScript. Works
   out of the box on a stock macOS install, no extra configuration. Good
-  enough for simple group-chat text sends, which is all LuthCal needs for
-  v1. **Use this unless you have a specific reason not to.**
+  enough for simple group-chat text sends on **macOS 15 and earlier**.
+  **Broken on macOS 26 (Tahoe)** — Messages' chat identifiers changed to an
+  `any;…` form the AppleScript dictionary rejects, so every send fails
+  ([bluebubbles-server#777](https://github.com/BlueBubblesApp/bluebubbles-server/issues/777),
+  open). On macOS 26 the choices are `private-api` below or running the
+  agent in silent mode (see "Silent mode").
 - **`private-api`**: talks to a private, undocumented Messages framework
   BlueBubbles hooks into directly. Gives richer behavior (delivery/read
   receipts, reactions, more reliable group-chat targeting) but **requires
