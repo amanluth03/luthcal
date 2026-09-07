@@ -6,7 +6,7 @@ import { familyMembers, messageLog } from "@/lib/db/schema";
 import { checkConflicts } from "@/lib/google/conflicts";
 import { formatNowForPrompt, getFamilyTimeZone } from "@/lib/google/time";
 import type { LuthEvent } from "@/lib/google/types";
-import { dedupeHistory, loadRecentThreadHistory } from "./history";
+import { dedupeHistory, formatHistory, loadRecentThreadHistory } from "./history";
 import type { RosterMember } from "./match-member";
 import { resolveSenderMemberId } from "./resolve-sender";
 import { buildAgentTools, type AgentSource } from "./tools";
@@ -293,12 +293,14 @@ export async function runAgent({ messages, source, chatGuid, senderHandle, engag
   const callerModelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
     m.role === "user" ? { role: "user", content: m.content } : { role: "assistant", content: m.content },
   );
-  // Deduped DB history first (oldest), then the caller's own messages (which
-  // for the dashboard already include resent history — dedupeHistory drops
-  // whatever overlaps so it isn't doubled; for iMessage this is just the
-  // single current turn, so nothing to dedupe against). coalesceConsecutiveRoles
+  // Deduped (on raw text, before prefixing) DB history first (oldest), then
+  // formatted into ModelMessages (sender-name prefix + cross-channel tag —
+  // see lib/agent/history.ts), then the caller's own messages (which for the
+  // dashboard already include resent history — dedupeHistory drops whatever
+  // overlaps so it isn't doubled; for iMessage this is just the single
+  // current turn, so nothing to dedupe against). coalesceConsecutiveRoles
   // guards against the merge ever violating strict user/assistant alternation.
-  const modelMessages: ModelMessage[] = coalesceConsecutiveRoles([...dedupeHistory(history, messages), ...callerModelMessages]);
+  const modelMessages: ModelMessage[] = coalesceConsecutiveRoles([...formatHistory(dedupeHistory(history, messages), source), ...callerModelMessages]);
 
   const result = await generateText({
     model: MODEL,

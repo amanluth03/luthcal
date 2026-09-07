@@ -1,4 +1,4 @@
-import { and, desc, eq, gte } from "drizzle-orm";
+import { and, desc, eq, gte, or } from "drizzle-orm";
 import type { ModelMessage } from "ai";
 
 import { getDb } from "@/lib/db";
@@ -7,22 +7,20 @@ import type { RosterMember } from "./match-member";
 import type { AgentSource } from "./tools";
 
 /**
- * Level-1 conversation memory (BUG 2 — see docs/agent-core.md "Level-1
- * conversation memory" for the full design writeup). This file is the whole
- * implementation: load recent message_log rows for the current run's
- * thread, and merge them with whatever the caller already passed in without
- * doubling anything up.
+ * Shared conversation memory across channels (see docs/superpowers/specs/
+ * 2026-09-07-shared-memory-design.md §1 for the full design writeup). One
+ * family thread — the dashboard chat and the iMessage group chat are no
+ * longer separate histories — so a conversation started on one channel is
+ * visible on the other.
  *
- * This is Level-1 (recent conversational turns) only — explicitly NOT
- * long-term fact memory ("Kai is allergic to peanuts" persisting across
- * unrelated conversations weeks later). That's Level-2, a separate,
- * deliberately deferred future task.
+ * Level-1 (recent conversational turns) only — explicitly NOT long-term fact
+ * memory, which lives in ./memory.ts (§2 of the same spec).
  */
 
-/** Last N message_log rows for the thread — bounds prompt size against a long back-and-forth. */
-export const HISTORY_MESSAGE_LIMIT = 20;
+/** Last N message_log rows for the family thread — bounds prompt size against a long back-and-forth. */
+export const HISTORY_MESSAGE_LIMIT = 30;
 /** Rows older than this are never pulled back in, regardless of count — bounds prompt size against staleness. */
-export const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface CallerMessage {
   role: "user" | "assistant";
@@ -30,41 +28,55 @@ interface CallerMessage {
 }
 
 /**
- * Loads recent history for this run's thread.
+ * One loaded message_log row, before formatting. Kept as raw metadata
+ * (rather than a ModelMessage) so `dedupeHistory` can dedup on raw `text`
+ * before `formatHistory` applies any sender-name prefix — see this module's
+ * doc comment and the spec's §1 "dedup-before-prefix" note.
+ */
+export interface ThreadHistoryRow {
+  direction: "inbound" | "outbound";
+  text: string;
+  /** Resolved sender label (roster name, falling back to the raw handle) — inbound rows only. */
+  senderLabel?: string;
+  /** The channel this row actually came from — drives formatHistory's cross-channel "(via X)" tag. */
+  source: "imessage" | "dashboard" | null;
+}
+
+function directionToRole(direction: "inbound" | "outbound"): "user" | "assistant" {
+  return direction === "outbound" ? "assistant" : "user";
+}
+
+/**
+ * The family-thread scope condition: dashboard rows are always in scope;
+ * iMessage rows are in scope for the run's own family chat — its own
+ * `chatGuid` for an iMessage run, `FAMILY_CHAT_GUID` for a dashboard run
+ * (dashboard-only scope if that's unset — there's then no known family chat
+ * to fold in). Rows with `source IS NULL` (written before the column
+ * existed) match neither branch, so they're simply never pulled back in.
+ */
+function buildFamilyThreadCondition(source: AgentSource, chatGuid: string | undefined) {
+  if (source === "imessage") {
+    const imessageCondition = chatGuid
+      ? and(eq(messageLog.source, "imessage"), eq(messageLog.chatGuid, chatGuid))
+      : eq(messageLog.source, "imessage");
+    return or(eq(messageLog.source, "dashboard"), imessageCondition);
+  }
+
+  const familyChatGuid = process.env.FAMILY_CHAT_GUID;
+  if (!familyChatGuid) return eq(messageLog.source, "dashboard");
+  return or(eq(messageLog.source, "dashboard"), and(eq(messageLog.source, "imessage"), eq(messageLog.chatGuid, familyChatGuid)));
+}
+
+/**
+ * Loads recent history for the family thread (see this module's doc comment
+ * for scope). Returns raw rows with metadata, oldest-first — callers run
+ * `dedupeHistory` then `formatHistory` to get `ModelMessage[]`.
  *
- * **Scope (F1 — positive discriminator, see docs/agent-core.md "message_log
- * source discriminator"):** scoping is keyed on `message_log.source`, not on
- * whether `chatGuid` happens to be null/non-null. Relying on chatGuid
- * null-ness was an unenforced assumption — nothing actually guaranteed an
- * iMessage row always carries a chat_guid, so a row that slipped through
- * without one would have silently leaked into the dashboard's "every
- * NULL-chat_guid row" scope.
- *  - `source === "imessage"`: scoped to `source = 'imessage' AND chat_guid =
- *    <chatGuid>` — one specific group chat's rows. If `chatGuid` itself is
- *    somehow missing (shouldn't happen — the webhook is expected to always
- *    supply one for iMessage-sourced runs), scoping degrades to
- *    `source = 'imessage'` alone rather than throwing.
- *  - `source === "dashboard"`: scoped to `source = 'dashboard'`. There's one
- *    family and no server-side dashboard session/thread id, so "every
- *    dashboard-origin message" is the only sensible single thread.
- *  - Rows written before this column existed (`source IS NULL`) match
- *    neither scope and are simply never pulled back in — see the column's
- *    own doc comment in lib/db/schema.ts.
- *
- * **Attribution:** inbound (user) rows are prefixed with the sender's
- * family-member name (`"Aman: dentist for Maya tuesday"`), but ONLY when
- * `source === "imessage"`. An iMessage group chat has multiple real senders,
- * so without attribution the model can't tell who said what across turns —
- * a concern flagged explicitly in app/api/webhooks/bluebubbles/route.ts's
- * own comment ("would need turn/sender attribution across a group chat with
- * multiple humans"), which this resolves. Falls back to the raw
- * `senderHandle` if the sender didn't resolve to a roster member. The
- * dashboard caller always resends its own full history verbatim, unprefixed
- * (see app/api/chat/route.ts / docs/agent-core.md §2b) on every request —
- * prefixing dashboard history here would make it byte-for-byte different
- * from what the caller resends and defeat `dedupeHistory` below, so it's
- * skipped there; the dashboard is effectively single-sender anyway (one
- * signed-in session at a time).
+ * **Attribution:** every inbound row's `senderLabel` is resolved (roster
+ * name via `memberId`, falling back to the raw `senderHandle`) regardless of
+ * channel — unlike the old per-channel design, dashboard rows are no longer
+ * left unprefixed, since dedup now happens on raw text (before formatting),
+ * so uniform prefixing can't break it.
  *
  * Degrades to `[]` (never throws) if `getDb()`/`DATABASE_URL` is
  * unavailable — mirrors `lib/agent/index.ts`'s `getFamilyRoster`, so
@@ -74,15 +86,10 @@ export async function loadRecentThreadHistory(
   source: AgentSource,
   chatGuid: string | undefined,
   roster: RosterMember[],
-): Promise<ModelMessage[]> {
+): Promise<ThreadHistoryRow[]> {
   try {
     const db = getDb();
-    const threadCondition =
-      source === "imessage"
-        ? chatGuid
-          ? and(eq(messageLog.source, "imessage"), eq(messageLog.chatGuid, chatGuid))
-          : eq(messageLog.source, "imessage")
-        : eq(messageLog.source, "dashboard");
+    const threadCondition = buildFamilyThreadCondition(source, chatGuid);
     const cutoff = new Date(Date.now() - HISTORY_MAX_AGE_MS);
 
     const rows = await db
@@ -91,6 +98,7 @@ export async function loadRecentThreadHistory(
         text: messageLog.text,
         senderHandle: messageLog.senderHandle,
         memberId: messageLog.memberId,
+        source: messageLog.source,
       })
       .from(messageLog)
       .where(and(threadCondition, gte(messageLog.createdAt, cutoff)))
@@ -101,10 +109,10 @@ export async function loadRecentThreadHistory(
 
     return rows
       .reverse() // DB order is newest-first (for the LIMIT); conversation order is oldest-first.
-      .map((row): ModelMessage => {
-        if (row.direction === "outbound") return { role: "assistant", content: row.text };
-        const label = source === "imessage" ? (row.memberId && nameById.get(row.memberId)) || row.senderHandle || undefined : undefined;
-        return { role: "user", content: label ? `${label}: ${row.text}` : row.text };
+      .map((row): ThreadHistoryRow => {
+        if (row.direction === "outbound") return { direction: "outbound", text: row.text, source: row.source };
+        const senderLabel = (row.memberId && nameById.get(row.memberId)) || row.senderHandle || undefined;
+        return { direction: "inbound", text: row.text, senderLabel, source: row.source };
       });
   } catch (err) {
     console.error("[lib/agent] failed to load conversation history (continuing without it)", err);
@@ -123,13 +131,7 @@ export async function loadRecentThreadHistory(
  * no roster/attribution, no dashboard scope) — the engagement gate only
  * ever needs to know about the ONE most recent thing the agent itself said
  * in an iMessage thread, with its timestamp, to bound how "pending" a
- * suggestion still is. See docs/agent-core.md's passive-listener section
- * for the full design and the exact webhook hand-off using this.
- *
- * Scoped to `source = 'imessage'` (see the F1 note on `loadRecentThreadHistory`
- * above) — this helper has no dashboard use case, so it doesn't take a
- * `source` param at all. Degrades to `null` (never throws) on any DB error
- * or when there's no prior outbound message in the thread.
+ * suggestion still is. Unaffected by the family-thread scope change above.
  */
 export async function loadLastOutboundMessage(chatGuid: string): Promise<{ text: string; createdAt: Date } | null> {
   try {
@@ -148,23 +150,37 @@ export async function loadLastOutboundMessage(chatGuid: string): Promise<{ text:
 }
 
 /**
- * Drops any loaded-history message whose (role, content) already appears
- * verbatim in `callerMessages` — otherwise the dashboard's resent history
- * (mid-session; see app/api/chat/route.ts) would be doubled up with the same
- * turns pulled back from message_log. A history message with no
- * caller-side counterpart (a fresh dashboard page load with empty
- * client-side state, or the iMessage path, which never resends history at
- * all) passes through untouched — that's the whole point of loading it.
+ * Drops any loaded-history row whose (direction-as-role, RAW text) already
+ * appears verbatim in `callerMessages` — otherwise the dashboard's resent
+ * history (mid-session; see app/api/chat/route.ts) would be doubled up with
+ * the same turns pulled back from message_log. Runs on raw text, before
+ * `formatHistory` applies any sender-name prefix — see this module's doc
+ * comment.
  *
  * Exact-string dedup, not fuzzy: a false-negative (an occasional literal
  * repeat like "yes" surviving in both places) just costs a few duplicate
  * prompt tokens, which is a far smaller risk than a false-positive dropping
  * a real, distinct turn because its text happened to match something else.
  */
-export function dedupeHistory(history: ModelMessage[], callerMessages: CallerMessage[]): ModelMessage[] {
-  const seen = new Set(callerMessages.map((m) => `${m.role} ${m.content}`));
-  return history.filter((m) => {
-    const content = typeof m.content === "string" ? m.content : "";
-    return !seen.has(`${m.role} ${content}`);
+export function dedupeHistory(rows: ThreadHistoryRow[], callerMessages: CallerMessage[]): ThreadHistoryRow[] {
+  const seen = new Set(callerMessages.map((m) => `${m.role} ${m.content}`));
+  return rows.filter((row) => !seen.has(`${directionToRole(row.direction)} ${row.text}`));
+}
+
+/**
+ * Formats deduped `ThreadHistoryRow`s into `ModelMessage[]` for the current
+ * run. Every inbound row is prefixed with its `senderLabel` (when resolved);
+ * a row whose `source` differs from `currentSource` additionally carries a
+ * cross-channel tag — `"Vijay (via iMessage): …"` in a dashboard run,
+ * `"Aman (via dashboard): …"` in an iMessage run — so the model can tell a
+ * same-channel turn from one that happened on the other channel. Outbound
+ * rows are always plain `assistant` messages, untagged.
+ */
+export function formatHistory(rows: ThreadHistoryRow[], currentSource: AgentSource): ModelMessage[] {
+  return rows.map((row): ModelMessage => {
+    if (row.direction === "outbound") return { role: "assistant", content: row.text };
+    const crossChannelTag = row.source && row.source !== currentSource ? ` (via ${row.source === "imessage" ? "iMessage" : "dashboard"})` : "";
+    const prefix = row.senderLabel ? `${row.senderLabel}${crossChannelTag}: ` : "";
+    return { role: "user", content: `${prefix}${row.text}` };
   });
 }

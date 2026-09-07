@@ -1,25 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelMessage } from "ai";
 
 import type { RosterMember } from "@/lib/agent/match-member";
 
 // ---------------------------------------------------------------------------
-// BUG 2: Level-1 conversation memory. Three things under test:
+// Shared memory across channels, section 1 (docs/superpowers/specs/2026-09-07-shared-memory-design.md):
+// one family thread instead of one thread per channel. Four things under test:
 //
-//  - dedupeHistory (pure): the merge logic that stops the dashboard's
-//    resent history from being doubled up with what loadRecentThreadHistory
-//    pulls back from message_log.
-//  - loadRecentThreadHistory: scope (F1 — source discriminator, not
-//    chatGuid null-ness; see docs/agent-core.md "message_log source
-//    discriminator"), window (last N rows / last X ms), and
-//    sender-attribution (name-prefixed only for source "imessage").
-//    Exercised against a fake in-memory message_log, following the same
-//    real-drizzle-operators / fake-query-builder pattern as
-//    tests/google/event-meta-dedup.test.ts, so the actual production
-//    where/orderBy/limit logic runs for real.
-//  - loadLastOutboundMessage: the narrower single-row helper the
-//    passive-listener engagement gate (lib/agent/engagement.ts) uses for
-//    its pending-confirmation check.
+//  - dedupeHistory (pure): filters raw ThreadHistoryRow entries against the
+//    caller-resent messages, BEFORE any sender-name prefix is applied (the
+//    prefix is now applied uniformly to both channels by formatHistory, so
+//    dedup has to run on the underlying raw text or it would never match).
+//  - loadRecentThreadHistory: family-thread scope (dashboard rows always in
+//    scope; iMessage rows in scope for the run's own family chat), the
+//    30-row/7-day window, and per-row sender-label resolution (now for BOTH
+//    channels, not iMessage-only).
+//  - formatHistory: turns loaded rows into ModelMessage[], adding a
+//    "(via iMessage)"/"(via dashboard)" tag only when a row's channel
+//    differs from the current run's channel.
+//  - loadLastOutboundMessage: unchanged — the passive-listener engagement
+//    gate's single-row helper.
 // ---------------------------------------------------------------------------
 
 interface FakeMessageLogRow {
@@ -39,6 +38,7 @@ vi.mock("drizzle-orm", () => ({
   isNull: (column: unknown) => ({ op: "isNull" as const, column }),
   gte: (column: unknown, value: unknown) => ({ op: "gte" as const, column, value }),
   and: (...conds: unknown[]) => ({ op: "and" as const, conds }),
+  or: (...conds: unknown[]) => ({ op: "or" as const, conds }),
   desc: (column: unknown) => ({ op: "desc" as const, column }),
 }));
 
@@ -54,6 +54,7 @@ vi.mock("@/lib/db", () => ({
       if (!cond) return true;
       const c = cond as { op: string; column?: unknown; value?: unknown; conds?: unknown[] };
       if (c.op === "and") return (c.conds ?? []).every((sub) => matches(row, sub));
+      if (c.op === "or") return (c.conds ?? []).some((sub) => matches(row, sub));
       const key = columnKey(c.column);
       if (c.op === "eq") return row[key] === c.value;
       if (c.op === "isNull") return row[key] == null;
@@ -102,7 +103,15 @@ vi.mock("@/lib/db", () => ({
 
 // Imported AFTER the mocks above so the module under test picks them up.
 import { messageLog } from "@/lib/db/schema";
-import { dedupeHistory, HISTORY_MAX_AGE_MS, HISTORY_MESSAGE_LIMIT, loadLastOutboundMessage, loadRecentThreadHistory } from "@/lib/agent/history";
+import {
+  dedupeHistory,
+  formatHistory,
+  HISTORY_MAX_AGE_MS,
+  HISTORY_MESSAGE_LIMIT,
+  loadLastOutboundMessage,
+  loadRecentThreadHistory,
+  type ThreadHistoryRow,
+} from "@/lib/agent/history";
 
 function seedRow(row: Partial<FakeMessageLogRow> & { direction: "inbound" | "outbound"; text: string; createdAt: Date }) {
   state.rows.push({ source: null, chatGuid: null, senderHandle: null, memberId: null, ...row });
@@ -115,66 +124,83 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 // ---------------------------------------------------------------------------
 // dedupeHistory (pure)
 // ---------------------------------------------------------------------------
 
-describe("dedupeHistory(history, callerMessages)", () => {
-  it("drops a history message whose (role, content) already appears in callerMessages", () => {
-    const history: ModelMessage[] = [
-      { role: "user", content: "book dentist tuesday" },
-      { role: "assistant", content: "Done!" },
+describe("dedupeHistory(rows, callerMessages)", () => {
+  it("drops a row whose (direction-as-role, raw text) already appears in callerMessages", () => {
+    const rows: ThreadHistoryRow[] = [
+      { direction: "inbound", text: "book dentist tuesday", senderLabel: "Aman", source: "dashboard" },
+      { direction: "outbound", text: "Done!", source: "dashboard" },
     ];
     const caller = [
       { role: "user" as const, content: "book dentist tuesday" },
       { role: "assistant" as const, content: "Done!" },
       { role: "user" as const, content: "actually move it to 4" },
     ];
-    expect(dedupeHistory(history, caller)).toEqual([]);
+    expect(dedupeHistory(rows, caller)).toEqual([]);
   });
 
-  it("passes through history the caller has no record of (the reload / iMessage case)", () => {
-    const history: ModelMessage[] = [
-      { role: "user", content: "book dentist tuesday" },
-      { role: "assistant", content: "Done!" },
-    ];
+  it("passes through rows the caller has no record of", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist tuesday", senderLabel: "Aman", source: "dashboard" }];
     const caller = [{ role: "user" as const, content: "actually move it to 4" }];
-    expect(dedupeHistory(history, caller)).toEqual(history);
+    expect(dedupeHistory(rows, caller)).toEqual(rows);
   });
 
-  it("only drops an exact (role, content) match, not a same-role/different-content pair", () => {
-    const history: ModelMessage[] = [{ role: "user", content: "book dentist tuesday" }];
+  it("only drops an exact (role, raw text) match, not a same-role/different-content pair", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist tuesday", source: "dashboard" }];
     const caller = [{ role: "user" as const, content: "something else entirely" }];
-    expect(dedupeHistory(history, caller)).toEqual(history);
+    expect(dedupeHistory(rows, caller)).toEqual(rows);
+  });
+
+  it("dedupes on RAW text, before any sender-name prefix would be applied", () => {
+    // If dedup ran on formatted ("Aman: book dentist tuesday") instead of raw
+    // text, this would fail to match the caller's unprefixed resend.
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist tuesday", senderLabel: "Aman", source: "dashboard" }];
+    const caller = [{ role: "user" as const, content: "book dentist tuesday" }];
+    expect(dedupeHistory(rows, caller)).toEqual([]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// loadRecentThreadHistory
+// loadRecentThreadHistory — family-thread scope
 // ---------------------------------------------------------------------------
 
-const roster: RosterMember[] = [{ id: "m-aman", name: "Aman", aliases: [], imessageHandle: "aman@example.com", phone: null }];
+const roster: RosterMember[] = [
+  { id: "m-aman", name: "Aman", aliases: [], imessageHandle: "aman@example.com", phone: null },
+  { id: "m-vijay", name: "Vijay", aliases: [], imessageHandle: null, phone: "+15125550100" },
+];
 
-describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
-  it("scopes to source 'imessage' + the given chatGuid, excluding other chats and dashboard rows", async () => {
+describe("loadRecentThreadHistory(source, chatGuid, roster) — family-thread scope", () => {
+  it("iMessage run: includes dashboard rows and this chat's iMessage rows; excludes other chats", async () => {
     seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
     seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-b", text: "in chat b", createdAt: new Date() });
     seedRow({ direction: "inbound", source: "dashboard", chatGuid: null, text: "dashboard message", createdAt: new Date() });
 
     const history = await loadRecentThreadHistory("imessage", "chat-a", []);
-    expect(history).toHaveLength(1);
-    expect(history[0].content).toBe("in chat a");
+    expect(history.map((r) => r.text).sort()).toEqual(["dashboard message", "in chat a"].sort());
   });
 
-  it("scopes to source 'dashboard' rows when source is 'dashboard', regardless of chatGuid", async () => {
+  it("dashboard run: includes dashboard rows and FAMILY_CHAT_GUID's iMessage rows when set", async () => {
+    vi.stubEnv("FAMILY_CHAT_GUID", "chat-a");
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "in the family chat", createdAt: new Date() });
+    seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-b", text: "in some other chat", createdAt: new Date() });
+    seedRow({ direction: "inbound", source: "dashboard", chatGuid: null, text: "dashboard message", createdAt: new Date() });
+
+    const history = await loadRecentThreadHistory("dashboard", undefined, []);
+    expect(history.map((r) => r.text).sort()).toEqual(["dashboard message", "in the family chat"].sort());
+  });
+
+  it("dashboard run: falls back to dashboard-only scope when FAMILY_CHAT_GUID is unset", async () => {
     seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "in chat a", createdAt: new Date() });
     seedRow({ direction: "inbound", source: "dashboard", chatGuid: null, text: "dashboard message", createdAt: new Date() });
 
     const history = await loadRecentThreadHistory("dashboard", undefined, []);
-    expect(history).toHaveLength(1);
-    expect(history[0].content).toBe("dashboard message");
+    expect(history.map((r) => r.text)).toEqual(["dashboard message"]);
   });
 
   it("F1: rows with no source at all (written before the column existed) match neither scope", async () => {
@@ -193,11 +219,11 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
     seedRow({ direction: "inbound", source: "imessage", chatGuid: "chat-a", text: "third", createdAt: new Date("2026-07-13T10:02:00Z") });
 
     const history = await loadRecentThreadHistory("imessage", "chat-a", []);
-    expect(history.map((m) => m.content)).toEqual(["first", "second", "third"]);
-    expect(history.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(history.map((m) => m.text)).toEqual(["first", "second", "third"]);
+    expect(history.map((m) => m.direction)).toEqual(["inbound", "outbound", "inbound"]);
   });
 
-  it("excludes rows older than HISTORY_MAX_AGE_MS", async () => {
+  it("excludes rows older than HISTORY_MAX_AGE_MS (7 days)", async () => {
     const now = new Date("2026-07-13T12:00:00Z");
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -212,7 +238,12 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
     });
 
     const history = await loadRecentThreadHistory("imessage", "chat-a", []);
-    expect(history.map((m) => m.content)).toEqual(["recent"]);
+    expect(history.map((m) => m.text)).toEqual(["recent"]);
+  });
+
+  it("HISTORY_MAX_AGE_MS is 7 days and HISTORY_MESSAGE_LIMIT is 30", () => {
+    expect(HISTORY_MAX_AGE_MS).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(HISTORY_MESSAGE_LIMIT).toBe(30);
   });
 
   it("caps at HISTORY_MESSAGE_LIMIT, keeping the most recent rows", async () => {
@@ -226,12 +257,12 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
 
     const history = await loadRecentThreadHistory("imessage", "chat-a", []);
     expect(history).toHaveLength(HISTORY_MESSAGE_LIMIT);
-    // Oldest 5 (msg-0..msg-4) fall outside the LIMIT-most-recent window.
-    expect(history[0].content).toBe("msg-5");
-    expect(history[history.length - 1].content).toBe(`msg-${HISTORY_MESSAGE_LIMIT + 4}`);
+    expect(history[0].text).toBe("msg-5");
+    expect(history[history.length - 1].text).toBe(`msg-${HISTORY_MESSAGE_LIMIT + 4}`);
   });
 
-  it("prefixes inbound messages with the resolved member's name for source 'imessage' (multi-sender thread)", async () => {
+  it("resolves a sender label for inbound rows from BOTH channels (roster name, falling back to raw handle)", async () => {
+    const now = Date.now();
     seedRow({
       direction: "inbound",
       source: "imessage",
@@ -239,14 +270,17 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
       memberId: "m-aman",
       senderHandle: "aman@example.com",
       text: "dentist for Maya tuesday",
-      createdAt: new Date(),
+      createdAt: new Date(now - 3000),
     });
-
-    const history = await loadRecentThreadHistory("imessage", "chat-a", roster);
-    expect(history[0].content).toBe("Aman: dentist for Maya tuesday");
-  });
-
-  it("falls back to the raw senderHandle when memberId doesn't resolve to a roster name", async () => {
+    seedRow({
+      direction: "inbound",
+      source: "dashboard",
+      chatGuid: null,
+      memberId: "m-vijay",
+      senderHandle: "vijay@example.com",
+      text: "book dentist",
+      createdAt: new Date(now - 2000),
+    });
     seedRow({
       direction: "inbound",
       source: "imessage",
@@ -254,26 +288,17 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
       memberId: null,
       senderHandle: "+15125550199",
       text: "hi",
-      createdAt: new Date(),
+      createdAt: new Date(now - 1000),
     });
 
     const history = await loadRecentThreadHistory("imessage", "chat-a", roster);
-    expect(history[0].content).toBe("+15125550199: hi");
+    expect(history.map((r) => r.senderLabel)).toEqual(["Aman", "Vijay", "+15125550199"]);
   });
 
-  it("does NOT prefix dashboard (source 'dashboard') history, even with a resolvable member", async () => {
-    seedRow({
-      direction: "inbound",
-      source: "dashboard",
-      chatGuid: null,
-      memberId: "m-aman",
-      senderHandle: "aman@example.com",
-      text: "book dentist",
-      createdAt: new Date(),
-    });
-
-    const history = await loadRecentThreadHistory("dashboard", undefined, roster);
-    expect(history[0].content).toBe("book dentist");
+  it("outbound rows carry no senderLabel", async () => {
+    seedRow({ direction: "outbound", source: "imessage", chatGuid: "chat-a", text: "Done!", createdAt: new Date() });
+    const history = await loadRecentThreadHistory("imessage", "chat-a", roster);
+    expect(history[0].senderLabel).toBeUndefined();
   });
 
   it("degrades to [] (no throw) when getDb() throws — e.g. no DATABASE_URL set", async () => {
@@ -283,8 +308,45 @@ describe("loadRecentThreadHistory(source, chatGuid, roster)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadLastOutboundMessage — the narrower helper the passive-listener
-// engagement gate (lib/agent/engagement.ts) uses for pending-confirmation.
+// formatHistory — attribution + cross-channel tag
+// ---------------------------------------------------------------------------
+
+describe("formatHistory(rows, currentSource)", () => {
+  it("prefixes an inbound row's own-channel text with just the sender label", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "dentist for Maya tuesday", senderLabel: "Aman", source: "imessage" }];
+    expect(formatHistory(rows, "imessage")).toEqual([{ role: "user", content: "Aman: dentist for Maya tuesday" }]);
+  });
+
+  it("tags a cross-channel row '(via iMessage)' when formatting for a dashboard run", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist", senderLabel: "Vijay", source: "imessage" }];
+    expect(formatHistory(rows, "dashboard")).toEqual([{ role: "user", content: "Vijay (via iMessage): book dentist" }]);
+  });
+
+  it("tags a cross-channel row '(via dashboard)' when formatting for an iMessage run", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist", senderLabel: "Aman", source: "dashboard" }];
+    expect(formatHistory(rows, "imessage")).toEqual([{ role: "user", content: "Aman (via dashboard): book dentist" }]);
+  });
+
+  it("does not tag a same-channel row even for a dashboard row formatted for a dashboard run", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "book dentist", senderLabel: "Aman", source: "dashboard" }];
+    expect(formatHistory(rows, "dashboard")).toEqual([{ role: "user", content: "Aman: book dentist" }]);
+  });
+
+  it("renders outbound rows as plain assistant messages, untagged and unprefixed", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "outbound", text: "Done!", source: "imessage" }];
+    expect(formatHistory(rows, "dashboard")).toEqual([{ role: "assistant", content: "Done!" }]);
+  });
+
+  it("leaves an inbound row with no resolvable senderLabel unprefixed", () => {
+    const rows: ThreadHistoryRow[] = [{ direction: "inbound", text: "hi", source: "dashboard" }];
+    expect(formatHistory(rows, "dashboard")).toEqual([{ role: "user", content: "hi" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadLastOutboundMessage — unchanged, the narrower single-row helper the
+// passive-listener engagement gate (lib/agent/engagement.ts) uses for its
+// pending-confirmation check.
 // ---------------------------------------------------------------------------
 
 describe("loadLastOutboundMessage(chatGuid)", () => {
