@@ -25,6 +25,7 @@ import { generateText, Output } from "ai";
 import { z } from "zod";
 
 import { CLASSIFIER_MODEL } from "./model";
+import { isAgentSilent } from "./silent";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -330,6 +331,13 @@ async function classifyEventWithTime(text: string): Promise<boolean> {
 export async function decideEngagement({ text, agentNames, lastAgentMessage }: DecideEngagementOptions): Promise<EngagementDecision> {
   if (isMentioned(text, agentNames ?? getDefaultAgentNames())) {
     return { engage: true, reason: "mentioned", mode: "act" };
+  }
+
+  // Silent mode (./silent.ts): the agent can't ask "want me to add that?"
+  // or answer a reply to a question it never sent, so only an explicit
+  // mention engages — no pending-confirmation check, no classifier call.
+  if (isAgentSilent()) {
+    return { engage: false, reason: "none", mode: "silent" };
   }
 
   if (isPendingConfirmationReply(lastAgentMessage)) {

@@ -11,6 +11,7 @@ import type { RosterMember } from "./match-member";
 import { formatMemoriesForPrompt, loadActiveMemories, type MemoryRow } from "./memory";
 import { AGENT_MODEL } from "./model";
 import { resolveSenderMemberId } from "./resolve-sender";
+import { isAgentSilent } from "./silent";
 import { buildAgentTools, type AgentSource } from "./tools";
 
 // A single conversational turn is: parse -> maybe list/create/update/delete
@@ -131,6 +132,12 @@ function buildSystemPrompt(source: AgentSource, roster: RosterMember[], mode: "a
       ? `
 
 PASSIVE-SUGGESTION MODE FOR THIS TURN: nobody explicitly addressed you — this message was noticed by passive, ambient monitoring of the group chat because it looks like it describes a schedulable event. createEvent, updateEvent, and deleteEvent are UNAVAILABLE to you this turn (they are not in your tool list) — you cannot create, change, or cancel anything right now, on purpose. Your only job is to reply with ONE short sentence that (a) names who/what/when you think this is, and (b) asks whether to add it — e.g. "Want me to add Maya's dentist for Tue 3pm?". Do not use listEvents/checkConflicts speculatively for this — just ask. If a reply later confirms it, you'll be re-invoked with full tool access to actually create it and can use conversation history above to see what was suggested. If the message turns out NOT to actually describe a concrete event on reflection, it's fine (and preferred) to reply with something brief and low-key rather than force a suggestion, or even just acknowledge lightly — this passive path is deliberately conservative and a soft miss here is much cheaper than a wrong or annoying suggestion.`
+      : ""
+  }${
+    isAgentSilent()
+      ? `
+
+SILENT MODE: your reply is NOT delivered to the group chat. The family only sees what you do on the shared calendar (it syncs to their phones) and your reply as a line in the web dashboard's activity log. So: act on clear, explicit requests directly; never ask a clarifying question (nobody can answer it). If a request is genuinely ambiguous, do nothing and say in one line what you'd need — someone will finish it on the dashboard. Keep every reply to one short line; it's a log entry, not a text.`
       : ""
   }
 

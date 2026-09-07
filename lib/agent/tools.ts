@@ -1,4 +1,4 @@
-import { tool } from "ai";
+import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
 import { checkConflicts as gCheckConflicts } from "@/lib/google/conflicts";
@@ -12,6 +12,7 @@ import {
 import { matchMember, type RosterMember } from "./match-member";
 import { forgetMemory, rememberMemory, searchHistory as searchFamilyHistory } from "./memory";
 import { enqueueOutbound } from "./outbound";
+import { isAgentSilent } from "./silent";
 
 /** Where this agent run originated. Determines event_meta.created_via and the announcement path — see docs/agent-core.md. */
 export type AgentSource = "imessage" | "dashboard";
@@ -127,7 +128,7 @@ function requireFamilyChatGuid(): string {
  * it tried, regardless of what the system prompt says or how the model
  * chooses to (mis)read it.
  */
-export function buildAgentTools(ctx: AgentToolContext) {
+export function buildAgentTools(ctx: AgentToolContext): ToolSet {
   const allTools = {
     createEvent: tool({
       description:
@@ -352,7 +353,15 @@ export function buildAgentTools(ctx: AgentToolContext) {
     // calendar mutation). remember/forget are deliberately excluded — see
     // this function's doc comment above.
     const { listEvents, checkConflicts, sendGroupMessage, searchHistory } = allTools;
-    return { listEvents, checkConflicts, sendGroupMessage, searchHistory };
+    return isAgentSilent() ? { listEvents, checkConflicts, searchHistory } : { listEvents, checkConflicts, sendGroupMessage, searchHistory };
+  }
+
+  if (isAgentSilent()) {
+    // Silent mode (./silent.ts): nothing the agent says reaches the chat, so
+    // the one tool whose only job is sending a text is withheld. Explicit
+    // allowlist, same reason as the suggest-mode one above.
+    const { createEvent, updateEvent, deleteEvent, listEvents, checkConflicts, remember, forget, searchHistory } = allTools;
+    return { createEvent, updateEvent, deleteEvent, listEvents, checkConflicts, remember, forget, searchHistory };
   }
 
   return allTools;
