@@ -2,6 +2,7 @@ import { formatInTimeZone } from "date-fns-tz";
 import { eq } from "drizzle-orm";
 
 import { enqueueOutbound } from "@/lib/agent/outbound";
+import { isAgentSilent } from "@/lib/agent/silent";
 import { getDb } from "@/lib/db";
 import { settings } from "@/lib/db/schema";
 import { listEvents } from "@/lib/google/events";
@@ -22,9 +23,11 @@ const DAILY_SETTINGS_KEY = "last_daily_digest_sent";
 const WEEKLY_SETTINGS_KEY = "last_weekly_digest_sent";
 
 // Returns the family chat GUID, or null if the iMessage bridge isn't
-// configured yet. The digest treats null as "nowhere to deliver" and skips
-// gracefully (200) rather than failing — see the call site.
+// configured yet or the agent is in silent mode (lib/agent/silent.ts). The
+// digest treats null as "nowhere to deliver" and skips gracefully (200)
+// rather than failing — see the call site.
 function getFamilyChatGuid(): string | null {
+  if (isAgentSilent()) return null;
   return process.env.FAMILY_CHAT_GUID || null;
 }
 
@@ -137,7 +140,7 @@ export async function GET(request: Request) {
     if (!chatGuid) {
       // No iMessage bridge configured yet — nowhere to deliver the digest.
       // Skip successfully (and don't mark it sent) instead of failing.
-      return Response.json({ kind, skipped: true, reason: "FAMILY_CHAT_GUID not set" });
+      return Response.json({ kind, skipped: true, reason: isAgentSilent() ? "AGENT_SILENT" : "FAMILY_CHAT_GUID not set" });
     }
 
     const lastSent = await getLastSent(dedupKey);

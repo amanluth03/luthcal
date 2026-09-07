@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 
 import { enqueueOutbound } from "@/lib/agent/outbound";
+import { isAgentSilent } from "@/lib/agent/silent";
 import { getDb } from "@/lib/db";
 import { eventMeta } from "@/lib/db/schema";
 import { getEvent, listPendingAnnouncements } from "@/lib/google/events";
@@ -15,9 +16,11 @@ import { isValidCronRequest } from "@/lib/webhook-auth";
 // with event_meta.announced_at still null, formats it, and delivers it.
 
 // Returns the family chat GUID, or null if the iMessage bridge isn't
-// configured yet. Sweeps treat null as "nowhere to deliver" and skip
-// gracefully (200) rather than failing — see the call site.
+// configured yet or the agent is in silent mode (lib/agent/silent.ts).
+// Sweeps treat null as "nowhere to deliver" and skip gracefully (200)
+// rather than failing — see the call site.
 function getFamilyChatGuid(): string | null {
+  if (isAgentSilent()) return null;
   return process.env.FAMILY_CHAT_GUID || null;
 }
 
@@ -59,7 +62,7 @@ export async function GET(request: Request) {
     if (!chatGuid) {
       // No iMessage bridge configured yet — nowhere to deliver announcements.
       // Skip successfully instead of failing the sweep (and the pinger).
-      return Response.json({ skipped: "FAMILY_CHAT_GUID not set", announced: 0 });
+      return Response.json({ skipped: isAgentSilent() ? "AGENT_SILENT" : "FAMILY_CHAT_GUID not set", announced: 0 });
     }
     const pending = await listPendingAnnouncements();
 

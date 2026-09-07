@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 
 import { enqueueOutbound } from "@/lib/agent/outbound";
+import { isAgentSilent } from "@/lib/agent/silent";
 import { getDb } from "@/lib/db";
 import { eventMeta, settings } from "@/lib/db/schema";
 import { listUpcomingEventsPendingReminder } from "@/lib/google/events";
@@ -36,9 +37,11 @@ const DEFAULT_REMINDER_LEAD_MS = 2 * 60 * 60 * 1000; // 2h, per the task brief's
 const REMINDER_LEAD_SETTINGS_KEY = "reminder_lead_ms";
 
 // Returns the family chat GUID, or null if the iMessage bridge isn't
-// configured yet. The sweep treats null as "nowhere to deliver" and skips
-// gracefully (200) rather than failing — see the call site.
+// configured yet or the agent is in silent mode (lib/agent/silent.ts). The
+// sweep treats null as "nowhere to deliver" and skips gracefully (200)
+// rather than failing — see the call site.
 function getFamilyChatGuid(): string | null {
+  if (isAgentSilent()) return null;
   return process.env.FAMILY_CHAT_GUID || null;
 }
 
@@ -86,7 +89,7 @@ export async function GET(request: Request) {
     if (!chatGuid) {
       // No iMessage bridge configured yet — nowhere to deliver reminders.
       // Skip successfully instead of failing the sweep (and the pinger).
-      return Response.json({ skipped: "FAMILY_CHAT_GUID not set", reminded: 0 });
+      return Response.json({ skipped: isAgentSilent() ? "AGENT_SILENT" : "FAMILY_CHAT_GUID not set", reminded: 0 });
     }
     const leadMs = await getReminderLeadMs();
     const events = await listUpcomingEventsPendingReminder(leadMs);
