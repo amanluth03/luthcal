@@ -8,6 +8,7 @@ import { formatNowForPrompt, getFamilyTimeZone } from "@/lib/google/time";
 import type { LuthEvent } from "@/lib/google/types";
 import { dedupeHistory, formatHistory, loadRecentThreadHistory } from "./history";
 import type { RosterMember } from "./match-member";
+import { formatMemoriesForPrompt, loadActiveMemories, type MemoryRow } from "./memory";
 import { resolveSenderMemberId } from "./resolve-sender";
 import { buildAgentTools, type AgentSource } from "./tools";
 
@@ -119,7 +120,7 @@ function formatRoster(roster: RosterMember[]): string {
     .join("\n");
 }
 
-function buildSystemPrompt(source: AgentSource, roster: RosterMember[], mode: "act" | "suggest"): string {
+function buildSystemPrompt(source: AgentSource, roster: RosterMember[], mode: "act" | "suggest", memories: MemoryRow[]): string {
   const tz = getFamilyTimeZone();
 
   return `You are LuthCal, the scheduling assistant for the Luthra family. You normally live in their iMessage group chat${
@@ -137,6 +138,9 @@ Current date/time: ${formatNowForPrompt(tz)} (${tz}). Resolve all relative dates
 Family roster:
 ${formatRoster(roster)}
 
+Things the family has asked you to remember:
+${formatMemoriesForPrompt(memories, roster)}
+
 How to operate:
 1. Parse who the event is for, what it is, and when. When calling createEvent/updateEvent, pass memberNames as the name/alias text you read in the conversation (e.g. "Maya", "mom") — do NOT resolve those names to ids yourself; that's done deterministically, outside your control, against the roster above. The read-only tools are the one exception: checkConflicts and listEvents take member *ids*, not names — use the \`id:\` values shown in the roster above for those.
 2. If createEvent/updateEvent returns an ambiguousMember result instead of a created/updated event, the name you gave matched more than one family member (listed in candidates). Do not retry with a guess — ask the user which person they meant, then call the tool again once they've told you. If instead it returns unresolvedMemberNames alongside a created/updated event, those names matched nobody on the roster and were left off the event — briefly note that in your reply (e.g. "I didn't recognize 'Emma' as a family member, so I didn't tag anyone") so a typo or a missing roster entry gets caught, but don't block on it.
@@ -146,7 +150,10 @@ How to operate:
 6. Use listEvents to find an event's googleEventId (e.g. from context earlier in the conversation, or by asking what it's called and searching a reasonable window) before calling updateEvent or deleteEvent.
 7. Keep replies short and warm — they're going into a family group text, not a confirmation email. One or two sentences is usually enough.
 8. Only use sendGroupMessage for a message beyond your normal reply — your normal reply already reaches the chat, so don't send it twice.
-9. Earlier turns from message_log may appear above this instruction as prior conversation context, some possibly prefixed with "Name: " to show who said it in a group chat — treat them as real conversation history (e.g. resolving "make it 4 instead" against an event discussed a few turns ago), not as something to repeat back or comment on.`;
+9. Earlier turns from message_log may appear above this instruction as prior conversation context, some possibly prefixed with "Name: " to show who said it in a group chat — treat them as real conversation history (e.g. resolving "make it 4 instead" against an event discussed a few turns ago), not as something to repeat back or comment on.
+10. Save a memory (the \`remember\` tool) when someone explicitly asks you to remember something, or states a durable scheduling preference, standing pattern, or decision in a message addressed to you. Say "I'll remember that" in your reply.
+11. Don't use \`remember\` for one-off events (that's the calendar, via createEvent) or for things only inferred from unaddressed chatter.
+12. Use \`searchHistory\` when someone refers to an earlier conversation that isn't in the recent turns shown above.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,20 +282,24 @@ export async function runAgent({ messages, source, chatGuid, senderHandle, engag
   // and docs/agent-core.md for scope/window/dedup details.
   const history = await loadRecentThreadHistory(source, chatGuid, roster);
 
+  // BUG 1 — resolve senderHandle (iMessage handle, or the dashboard user's
+  // session email) to a family_members.id when it matches, so the activity
+  // feed can show a real name instead of "Unknown". Hoisted out of the
+  // inbound-logging block below so it can also be reused as the `remember`
+  // tool's created_by_member_id (see AgentToolContext.senderMemberId).
+  // Falls back to leaving member_id null (senderHandle is still stored, so
+  // the activity feed shows the raw handle/email rather than "Unknown")
+  // when it doesn't match anyone on the roster.
+  const senderMemberId = resolveSenderMemberId(senderHandle, roster);
+
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (lastUserMessage) {
-    // BUG 1 — resolve senderHandle (iMessage handle, or the dashboard
-    // user's session email) to a family_members.id when it matches, so the
-    // activity feed can show a real name instead of "Unknown". Falls back
-    // to leaving member_id null (senderHandle is still stored, so the
-    // activity feed shows the raw handle/email rather than "Unknown") when
-    // it doesn't match anyone on the roster.
-    const memberId = resolveSenderMemberId(senderHandle, roster);
-    await logMessage("inbound", { source, chatGuid, senderHandle, memberId, text: lastUserMessage.content });
+    await logMessage("inbound", { source, chatGuid, senderHandle, memberId: senderMemberId, text: lastUserMessage.content });
   }
 
-  const system = buildSystemPrompt(source, roster, mode);
-  const tools = buildAgentTools({ source, chatGuid, roster, mode });
+  const memories = await loadActiveMemories();
+  const system = buildSystemPrompt(source, roster, mode, memories);
+  const tools = buildAgentTools({ source, chatGuid, roster, mode, senderMemberId });
 
   const callerModelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
     m.role === "user" ? { role: "user", content: m.content } : { role: "assistant", content: m.content },

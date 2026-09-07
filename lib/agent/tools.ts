@@ -10,6 +10,7 @@ import {
   updateEvent as gUpdateEvent,
 } from "@/lib/google/events";
 import { matchMember, type RosterMember } from "./match-member";
+import { forgetMemory, rememberMemory, searchHistory as searchFamilyHistory } from "./memory";
 import { enqueueOutbound } from "./outbound";
 
 /** Where this agent run originated. Determines event_meta.created_via and the announcement path — see docs/agent-core.md. */
@@ -36,6 +37,15 @@ export interface AgentToolContext {
    * is never trusted as the sole guard against a mutating action.
    */
   mode?: "act" | "suggest";
+  /**
+   * The run's resolved sender — `resolveSenderMemberId(senderHandle, roster)`
+   * (see lib/agent/resolve-sender.ts), hoisted in lib/agent/index.ts's
+   * `runAgent` so it can be reused here as the `remember` tool's
+   * `created_by_member_id` (who told the agent to remember something),
+   * without a second lookup. `undefined` when the sender didn't resolve to
+   * a roster member — `remember` just saves the memory without a creator.
+   */
+  senderMemberId?: string;
 }
 
 /**
@@ -268,6 +278,67 @@ export function buildAgentTools(ctx: AgentToolContext) {
         return { queued: true };
       },
     }),
+
+    // Durable memory (docs/superpowers/specs/2026-09-07-shared-memory-design.md
+    // §2/§3) — separate from the recent-conversation-turns history in
+    // lib/agent/history.ts. remember/forget are act-mode only (see the
+    // suggest-mode allowlist below): the passive-listener path shouldn't be
+    // writing durable facts off an ambient message nobody actually asked it
+    // to save.
+    remember: tool({
+      description:
+        "Save a durable fact, preference, standing pattern, or decision the family wants you to remember across future conversations — NOT a one-off calendar event (use createEvent for that instead). Only call this when someone explicitly asks you to remember something, or states a durable scheduling preference/pattern/decision in a message addressed to you.",
+      inputSchema: z.object({
+        content: z.string().describe("One sentence, human-readable summary of the thing to remember, e.g. 'Yash has soccer every Tuesday 5-6pm.'"),
+        kind: z.enum(["preference", "pattern", "fact", "decision"]).optional().describe("Defaults to 'fact' if omitted."),
+        memberName: z
+          .string()
+          .optional()
+          .describe(
+            "Family member name/alias this memory is about, exactly as referenced in the conversation and matching the roster above (e.g. 'Maya') — NOT a family_members.id. Resolved the same deterministic way as an event's memberNames; if it matches more than one roster member, this returns an ambiguousMember result instead of saving, and you should ask which person they meant. Omit if the memory isn't about one specific family member.",
+          ),
+      }),
+      execute: async ({ content, kind, memberName }) => {
+        let memberId: string | undefined;
+        if (memberName) {
+          const resolved = resolveMemberNames([memberName], ctx.roster);
+          if ("ambiguousName" in resolved) {
+            return {
+              ambiguousMember: {
+                name: resolved.ambiguousName,
+                candidates: resolved.candidates.map((c) => ({ id: c.id, name: c.name })),
+              },
+            };
+          }
+          memberId = resolved.memberIds[0];
+        }
+        const remembered = await rememberMemory({ content, kind, memberId, createdByMemberId: ctx.senderMemberId, source: ctx.source });
+        return { remembered };
+      },
+    }),
+
+    forget: tool({
+      description:
+        "Archive a previously saved memory (soft-delete, never a hard delete) by its id. Use when the family says something like 'forget that' or a saved memory turns out wrong or outdated.",
+      inputSchema: z.object({ memoryId: z.string().describe("The id of the memory to forget — from a memory listed earlier in this prompt or conversation.") }),
+      execute: async ({ memoryId }) => {
+        await forgetMemory(memoryId);
+        return { forgotten: true };
+      },
+    }),
+
+    searchHistory: tool({
+      description:
+        "Search older family conversation beyond what's shown in the recent turns above (up to 90 days back by default, across both the group chat and the dashboard). Use when someone refers to an earlier conversation that isn't in front of you.",
+      inputSchema: z.object({
+        query: z.string().describe("Search text — every whitespace-separated word must appear (case-insensitively) in a matching message."),
+        sinceDays: z.number().optional().describe("How many days back to search. Defaults to 90."),
+      }),
+      execute: async ({ query, sinceDays }) => {
+        const results = await searchFamilyHistory({ query, sinceDays }, ctx.roster);
+        return { results };
+      },
+    }),
   };
 
   if (ctx.mode === "suggest") {
@@ -275,11 +346,13 @@ export function buildAgentTools(ctx: AgentToolContext) {
     // function's doc comment and AgentToolContext.mode. Built as an
     // explicit allowlist (rather than destructure-and-omit) so there's no
     // risk of a newly-added mutating tool silently staying available here
-    // by default. listEvents/checkConflicts stay available (read-only,
-    // useful context for phrasing the suggestion); sendGroupMessage stays
-    // available too (it's an extra message, not a calendar mutation).
-    const { listEvents, checkConflicts, sendGroupMessage } = allTools;
-    return { listEvents, checkConflicts, sendGroupMessage };
+    // by default. listEvents/checkConflicts/searchHistory stay available
+    // (read-only, useful context for phrasing the suggestion);
+    // sendGroupMessage stays available too (it's an extra message, not a
+    // calendar mutation). remember/forget are deliberately excluded — see
+    // this function's doc comment above.
+    const { listEvents, checkConflicts, sendGroupMessage, searchHistory } = allTools;
+    return { listEvents, checkConflicts, sendGroupMessage, searchHistory };
   }
 
   return allTools;
