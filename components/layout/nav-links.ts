@@ -1,5 +1,12 @@
 import type { LucideIcon } from "lucide-react";
-import { CalendarDays, ListChecks, MessageSquareText, Settings2, Users } from "lucide-react";
+import {
+  BrainCircuit,
+  CalendarDays,
+  ListChecks,
+  MessageSquareText,
+  Settings2,
+  Users,
+} from "lucide-react";
 
 export interface NavLink {
   href: string;
@@ -13,6 +20,7 @@ export const NAV_LINKS: NavLink[] = [
   { href: "/", label: "Calendar", icon: CalendarDays },
   { href: "/digests", label: "Digests", icon: MessageSquareText },
   { href: "/activity", label: "Activity", icon: ListChecks },
+  { href: "/memory", label: "Memory", icon: BrainCircuit },
   { href: "/family", label: "Family", icon: Users },
   { href: "/settings", label: "Settings", icon: Settings2 },
 ];
