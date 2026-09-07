@@ -14,8 +14,8 @@ import { familyMembers } from "../lib/db/schema";
 // their email the same, uniform way.
 //
 // `phone` (the iMessage-registered number, as it appears in BlueBubbles'
-// chat participant list) is deliberately not kept in this file — set it in
-// the database via the dashboard's Family page once each person is in the
+// chat participant list) is deliberately not kept in this file — set
+// family_members.phone directly in the database once each person is in the
 // chat (docs/bluebubbles-setup.md), so inbound sender→member matching works
 // over iMessage. Note: "son" is intentionally NOT an alias of either Aman or
 // Yash — it's ambiguous between them, so the agent should ask which son
