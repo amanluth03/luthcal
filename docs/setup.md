@@ -90,7 +90,6 @@ Fills: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `FAMI
 Generate random values (`openssl rand -hex 32`) for:
 - `CRON_SECRET` — guards `/api/cron/*` and the webhook auth. Vercel Cron sends
   it as `Authorization: Bearer <CRON_SECRET>`.
-- `FAMILY_PASSCODE` — the simple passcode gating the web dashboard.
 - `BLUEBUBBLES_WEBHOOK_SECRET` — the `?secret=` on the inbound BlueBubbles
   webhook URL (see §5).
 
@@ -157,7 +156,6 @@ and the Google watch channel + BlueBubbles webhook deliver real-time updates.
 | `GOOGLE_REFRESH_TOKEN` | §3b | long-lived Google auth |
 | `FAMILY_CALENDAR_ID` | §3c | the shared calendar |
 | `CRON_SECRET` | §4 | cron/webhook auth |
-| `FAMILY_PASSCODE` | §4 | dashboard gate |
 | `BLUEBUBBLES_WEBHOOK_SECRET` | §4/§5 | inbound webhook auth |
 | `FAMILY_TZ` | §4 | family timezone (all time math) |
 | `APP_BASE_URL` | §4 | watch-channel callback base |
