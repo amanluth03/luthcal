@@ -97,6 +97,9 @@ export async function pollInboundMessages(): Promise<PollInboundOutcome> {
   // lib/bluebubbles.ts's setBridgeUrl, updated by the webhook's "server URL
   // changed" handling) is picked up here too.
   const bridgeUrl = await getBridgeUrl();
+  // BlueBubbles' AuthMiddleware only reads the password from the query
+  // string (no header form), so it has to travel in the URL; never log
+  // `endpoint`.
   const endpoint =
     `${bridgeUrl.replace(/\/$/, "")}/api/v1/chat/${encodeURIComponent(familyChatGuid)}/message` +
     `?password=${encodeURIComponent(password)}&limit=${FETCH_LIMIT}&sort=DESC&after=${watermark}`;
