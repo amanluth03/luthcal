@@ -43,3 +43,6 @@ next-env.d.ts
 
 # Local subagent worktrees
 .claude/worktrees/
+
+# Playwright MCP session artifacts
+.playwright-mcp/
