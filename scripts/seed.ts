@@ -13,17 +13,17 @@ import { familyMembers } from "../lib/db/schema";
 // resolved to a family_members row on the dashboard. All four now carry
 // their email the same, uniform way.
 //
-// `imessageHandle`/`phone` are still TODO for every member — fill them in
-// during BlueBubbles bridge setup (docs/bluebubbles-setup.md) once each
-// person's iMessage-registered phone number / Apple ID is known, so outbound
-// texts and inbound sender→member matching work over iMessage too. Note:
-// "son" is intentionally NOT an alias of either Aman or Yash — it's
-// ambiguous between them, so the agent should ask which son rather than
-// guess.
+// `phone` (the iMessage-registered number, as it appears in BlueBubbles'
+// chat participant list) is deliberately not kept in this file — set it in
+// the database via the dashboard's Family page once each person is in the
+// chat (docs/bluebubbles-setup.md), so inbound sender→member matching works
+// over iMessage. Note: "son" is intentionally NOT an alias of either Aman or
+// Yash — it's ambiguous between them, so the agent should ask which son
+// rather than guess.
 const members = [
   {
     name: "Aman",
-    imessageHandle: null, // TODO(bridge-setup): Aman's iMessage phone/Apple ID
+    imessageHandle: null,
     phone: null,
     identifiers: ["amanluth03@gmail.com"],
     color: "#3b82f6", // blue
@@ -39,7 +39,7 @@ const members = [
   },
   {
     name: "Vijay",
-    imessageHandle: null, // TODO(bridge-setup): Vijay's iMessage phone/Apple ID
+    imessageHandle: null,
     phone: null,
     identifiers: ["vijay.luthra@gmail.com"],
     color: "#8b5cf6", // violet
