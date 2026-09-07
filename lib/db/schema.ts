@@ -5,6 +5,7 @@ import {
   jsonb,
   integer,
   uuid,
+  index,
 } from "drizzle-orm/pg-core";
 
 export const familyMembers = pgTable("family_members", {
@@ -99,11 +100,18 @@ export const messageLog = pgTable("message_log", {
   // docs/agent-core.md "message_log source discriminator" for the full
   // design note and lib/agent/history.ts for the scoping logic.
   source: text("source", { enum: ["imessage", "dashboard"] }),
+  // BlueBubbles' own message guid, set on inbound rows written by either the
+  // webhook (push delivery) or the inbound-poll cron backstop (REST-API
+  // pull, app/api/cron/inbound) — lets processInboundMessage
+  // (lib/inbound-processor.ts) tell whether a given iMessage was already run
+  // through the agent by the other path, without double-processing it.
+  // Nullable: outbound rows, and inbound rows predating this column, have none.
+  imessageGuid: text("imessage_guid"),
   text: text("text").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
-});
+}, (table) => [index("message_log_imessage_guid_idx").on(table.imessageGuid)]);
 
 // Durable things the family has told the agent to remember (preferences,
 // standing patterns, decisions), shared across the iMessage and dashboard
