@@ -249,29 +249,31 @@ describe("formatMemoriesForPrompt(memories, roster)", () => {
         createdAt: new Date("2026-09-07T17:00:00Z"), // noon-ish CDT
       },
     ];
-    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [pattern] Yash has soccer every Tuesday 5-6pm (about Yash; from Ekta, Sep 7)");
+    expect(formatMemoriesForPrompt(memories, roster)).toBe(
+      "- [pattern] Yash has soccer every Tuesday 5-6pm (about Yash; from Ekta, Sep 7) [id: mem-1]",
+    );
   });
 
   it("omits 'about X' when the memory isn't about a specific member", () => {
     const memories: MemoryRow[] = [
       { id: "mem-1", content: "We decided the beach trip is the 20th", kind: "decision", memberId: null, createdByMemberId: "m-aman", source: "dashboard", createdAt: new Date("2026-09-07T17:00:00Z") },
     ];
-    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [decision] We decided the beach trip is the 20th (from Aman, Sep 7)");
+    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [decision] We decided the beach trip is the 20th (from Aman, Sep 7) [id: mem-1]");
   });
 
   it("omits 'from X' when the creator didn't resolve to a roster member", () => {
     const memories: MemoryRow[] = [
       { id: "mem-1", content: "Dad means Vijay", kind: "fact", memberId: null, createdByMemberId: null, source: "imessage", createdAt: new Date("2026-09-07T17:00:00Z") },
     ];
-    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [fact] Dad means Vijay (Sep 7)");
+    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [fact] Dad means Vijay (Sep 7) [id: mem-1]");
   });
 
-  it("joins multiple memories with newlines, preserving the given order", () => {
+  it("joins multiple memories with newlines, preserving the given order, each carrying its own id so forget can target it", () => {
     const memories: MemoryRow[] = [
       { id: "mem-1", content: "first", kind: "fact", memberId: null, createdByMemberId: null, source: null, createdAt: new Date("2026-09-07T17:00:00Z") },
       { id: "mem-2", content: "second", kind: "fact", memberId: null, createdByMemberId: null, source: null, createdAt: new Date("2026-09-07T17:00:00Z") },
     ];
-    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [fact] first (Sep 7)\n- [fact] second (Sep 7)");
+    expect(formatMemoriesForPrompt(memories, roster)).toBe("- [fact] first (Sep 7) [id: mem-1]\n- [fact] second (Sep 7) [id: mem-2]");
   });
 });
 

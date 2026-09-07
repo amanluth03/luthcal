@@ -72,10 +72,11 @@ function formatShortDate(date: Date, tz: string): string {
 /**
  * Renders active memories as the block injected into the agent's system
  * prompt (see lib/agent/index.ts buildSystemPrompt), e.g.
- * `- [pattern] Yash has soccer every Tuesday 5-6pm (about Yash; from Ekta, Sep 7)`.
+ * `- [pattern] Yash has soccer every Tuesday 5-6pm (about Yash; from Ekta, Sep 7) [id: …]`.
  * "about X" is omitted when the memory isn't about one specific member;
  * "from X" is omitted when the creator didn't resolve to a roster member
- * (an unattributed memory still shows its save date). Assumes `memories` is
+ * (an unattributed memory still shows its save date). The id is what the
+ * `forget` tool takes, so it has to be visible here. Assumes `memories` is
  * already in the order it should be shown (loadActiveMemories' newest-first).
  */
 export function formatMemoriesForPrompt(memories: MemoryRow[], roster: RosterMember[]): string {
@@ -94,7 +95,7 @@ export function formatMemoriesForPrompt(memories: MemoryRow[], roster: RosterMem
       if (aboutName) detail.push(`about ${aboutName}`);
       detail.push(fromName ? `from ${fromName}, ${dateStr}` : dateStr);
 
-      return `- [${m.kind}] ${m.content} (${detail.join("; ")})`;
+      return `- [${m.kind}] ${m.content} (${detail.join("; ")}) [id: ${m.id}]`;
     })
     .join("\n");
 }

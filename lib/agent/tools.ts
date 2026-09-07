@@ -320,7 +320,7 @@ export function buildAgentTools(ctx: AgentToolContext) {
     forget: tool({
       description:
         "Archive a previously saved memory (soft-delete, never a hard delete) by its id. Use when the family says something like 'forget that' or a saved memory turns out wrong or outdated.",
-      inputSchema: z.object({ memoryId: z.string().describe("The id of the memory to forget — from a memory listed earlier in this prompt or conversation.") }),
+      inputSchema: z.object({ memoryId: z.string().describe("The memory's id, shown as [id: …] next to each entry under 'Things the family has asked you to remember' in your instructions.") }),
       execute: async ({ memoryId }) => {
         await forgetMemory(memoryId);
         return { forgotten: true };
