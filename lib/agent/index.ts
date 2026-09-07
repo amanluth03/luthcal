@@ -67,6 +67,13 @@ export interface RunAgentParams {
    *   access again and can actually create the event.
    */
   engagementMode?: "act" | "suggest";
+  /**
+   * The originating BlueBubbles message guid (source "imessage" only) —
+   * threaded through only as far as this turn's inbound message_log row, so
+   * lib/inbound-processor.ts's webhook/poller dedup check can tell a given
+   * iMessage has already been run through the agent.
+   */
+  imessageGuid?: string;
 }
 
 export interface RunAgentResult {
@@ -156,7 +163,7 @@ How to operate:
 
 async function logMessage(
   direction: "inbound" | "outbound",
-  opts: { source: AgentSource; chatGuid?: string; senderHandle?: string; memberId?: string; text: string },
+  opts: { source: AgentSource; chatGuid?: string; senderHandle?: string; memberId?: string; text: string; imessageGuid?: string },
 ): Promise<void> {
   try {
     const db = getDb();
@@ -167,6 +174,7 @@ async function logMessage(
       senderHandle: opts.senderHandle,
       memberId: opts.memberId,
       text: opts.text,
+      imessageGuid: opts.imessageGuid,
     });
   } catch (err) {
     console.error("[lib/agent] failed to write message_log (continuing)", err);
@@ -255,7 +263,7 @@ async function surfaceConflictWarnings(actions: AgentAction[]): Promise<string[]
 // Entry point
 // ---------------------------------------------------------------------------
 
-export async function runAgent({ messages, source, chatGuid, senderHandle, engagementMode }: RunAgentParams): Promise<RunAgentResult> {
+export async function runAgent({ messages, source, chatGuid, senderHandle, engagementMode, imessageGuid }: RunAgentParams): Promise<RunAgentResult> {
   // Deterministic, never chosen by the model — see RunAgentParams'
   // engagementMode doc comment and docs/agent-core.md's passive-listener
   // section. Always "act" for source "dashboard" (no passive-listener
@@ -288,7 +296,7 @@ export async function runAgent({ messages, source, chatGuid, senderHandle, engag
 
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (lastUserMessage) {
-    await logMessage("inbound", { source, chatGuid, senderHandle, memberId: senderMemberId, text: lastUserMessage.content });
+    await logMessage("inbound", { source, chatGuid, senderHandle, memberId: senderMemberId, text: lastUserMessage.content, imessageGuid });
   }
 
   const memories = await loadActiveMemories();

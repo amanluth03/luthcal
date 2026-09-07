@@ -1,13 +1,7 @@
 import { after } from "next/server";
 
-import { runAgent } from "@/lib/agent";
-import { decideEngagement } from "@/lib/agent/engagement";
-import { loadLastOutboundMessage } from "@/lib/agent/history";
-import { enqueueOutbound } from "@/lib/agent/outbound";
-import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-inbound";
-import { getDb } from "@/lib/db";
-import { messageLog } from "@/lib/db/schema";
 import { extractServerUrlChange, setBridgeUrl } from "@/lib/bluebubbles";
+import { processInboundMessage } from "@/lib/inbound-processor";
 import { isValidBlueBubblesWebhookSecret } from "@/lib/webhook-auth";
 
 // Inbound iMessage webhook. BlueBubbles POSTs every server-side event here
@@ -19,6 +13,15 @@ import { isValidBlueBubblesWebhookSecret } from "@/lib/webhook-auth";
 // unset). Register the callback URL as
 // `https://<deployment>/api/webhooks/bluebubbles?secret=<BLUEBUBBLES_WEBHOOK_SECRET>`
 // — see docs/bluebubbles-setup.md.
+//
+// This route only ever extracts the BlueBubbles-payload-shaped bits (auth,
+// JSON parsing, the "server URL changed" event, pulling chatGuid out of the
+// event body) and dispatches to lib/inbound-processor.ts's
+// processInboundMessage — the loop guards, family-chat filter, already-
+// processed dedup, passive-listener gate, and running the agent all live
+// there now, shared with app/api/cron/inbound (the REST-API poll backstop
+// for when BlueBubbles' own webhook poller stalls — see
+// docs/bluebubbles-setup.md).
 
 interface BlueBubblesEvent {
   type?: string;
@@ -26,6 +29,7 @@ interface BlueBubblesEvent {
 }
 
 interface NewMessageData {
+  guid?: string;
   text?: string;
   isFromMe?: boolean;
   handle?: { address?: string };
@@ -35,15 +39,6 @@ interface NewMessageData {
 function extractChatGuid(data: NewMessageData): string | undefined {
   const fromChats = data.chats?.[0]?.guid;
   return typeof fromChats === "string" && fromChats.length > 0 ? fromChats : undefined;
-}
-
-async function logInbound(chatGuid: string | undefined, senderHandle: string | undefined, text: string): Promise<void> {
-  try {
-    const db = getDb();
-    await db.insert(messageLog).values({ direction: "inbound", chatGuid, senderHandle, text });
-  } catch (err) {
-    console.error("[api/webhooks/bluebubbles] failed to write message_log (continuing)", err);
-  }
 }
 
 export async function POST(request: Request) {
@@ -81,123 +76,21 @@ export async function POST(request: Request) {
   }
 
   const data = (payload.data ?? {}) as NewMessageData;
-  const senderHandle = data.handle?.address;
 
-  // Critical loop guard: BlueBubbles echoes the agent's own outbound sends
-  // back through this same webhook as `isFromMe: true` (the field its
-  // MessageSerializer emits). Replying to our own message would have the
-  // agent talk to itself forever.
-  if (data.isFromMe) {
-    return new Response(null, { status: 200 });
-  }
-
-  // Second, independent guard: if `isFromMe` were ever renamed upstream the
-  // check above would fail OPEN, so also drop anything sent from the agent's
-  // own Apple ID (AGENT_IMESSAGE_HANDLE). Skipped if the env var isn't set.
-  const agentHandle = process.env.AGENT_IMESSAGE_HANDLE;
-  if (agentHandle && senderHandle && senderHandle.toLowerCase() === agentHandle.toLowerCase()) {
-    return new Response(null, { status: 200 });
-  }
-
-  const chatGuid = extractChatGuid(data);
-  const familyChatGuid = process.env.FAMILY_CHAT_GUID;
-  const rawText = typeof data.text === "string" ? data.text : "";
-  // F5 (cross-team dependency on senior-backend's lib/agent/normalize-inbound.ts):
-  // trims the raw inbound text and classifies it up front, before it's ever
-  // written to message_log or handed to runAgent. Unlike app/api/chat/route.ts
-  // (which rejects an over-length dashboard message with a 400 the user can
-  // see and react to), there's no synchronous response channel back to the
-  // sender here — BlueBubbles gets a fire-and-forget 200 regardless — so an
-  // over-length iMessage is capped (truncated to MAX_INBOUND_LENGTH) rather
-  // than silently dropped. `text` below is what both logInbound and runAgent
-  // use from here on — `rawText`/`normalized.text` are never logged or
-  // passed to the agent directly.
-  const normalized = normalizeInboundText(rawText);
-  const text = normalized.isTooLong ? normalized.text.slice(0, MAX_INBOUND_LENGTH) : normalized.text;
-  if (normalized.isTooLong) {
-    console.warn("[api/webhooks/bluebubbles] inbound text capped (over length limit)", { chatGuid, originalLength: normalized.text.length });
-  }
-
-  if (!chatGuid || !familyChatGuid || chatGuid !== familyChatGuid) {
-    // Not the family group chat — out of scope for v1 (no DMs, no other
-    // group chats), so this message never reaches runAgent. This webhook is
-    // the only place that will ever log it — keep the audit trail.
-    await logInbound(chatGuid, senderHandle, text || "(empty message)");
-    return new Response(null, { status: 200 });
-  }
-
-  if (normalized.isEmpty) {
-    // Attachment-only / tapback / empty-body message — nothing for the NLU
-    // agent to act on, so it never reaches runAgent either. Keep the audit
-    // trail for the same reason as the branch above.
-    await logInbound(chatGuid, senderHandle, "(empty message)");
-    return new Response(null, { status: 200 });
-  }
-
-  // F7 (tech-lead follow-up): everything from here on *does* reach the
-  // passive-listener engagement gate (lib/agent/engagement.ts
-  // `decideEngagement`, see docs/agent-core.md §9) — but only messages the
-  // gate decides to engage with go on to reach runAgent, which logs its own
-  // inbound message internally (see docs/agent-core.md). This webhook
-  // deliberately does NOT also call logInbound for this message: doing so
-  // unconditionally would produce a second, near-duplicate message_log row
-  // for every in-family message, and per tech-lead's explicit ruling on
-  // "open design question #1" in docs/agent-core.md §9, ambient chatter the
-  // gate silently ignores gets ZERO message_log footprint on purpose (that's
-  // the point of a passive listener) rather than a debug audit row. The two
-  // branches above (wrong chat, empty body) still log here directly, since
-  // those never reach the gate/runAgent at all and would otherwise have no
-  // audit trail.
-
-  // Respond to BlueBubbles fast; do the actual gate-check + NLU + Google
-  // Calendar + outbound-enqueue work after the response is flushed (mirrors
-  // app/api/webhooks/google/route.ts's use of `after()` for the same
-  // "acknowledge fast, work after" reason). Both the engagement gate's
-  // classifier call (decideEngagement makes at most one network call) and
-  // runAgent run inside this same after() callback, so neither ever delays
-  // the 200 ack to BlueBubbles below.
+  // Respond to BlueBubbles fast; do the actual guard/gate/NLU/enqueue work
+  // after the response is flushed (mirrors app/api/webhooks/google/route.ts's
+  // use of `after()` for the same "acknowledge fast, work after" reason).
   after(async () => {
     try {
-      // Passive-listener engagement gate (lib/agent/engagement.ts,
-      // docs/agent-core.md §9) — decides whether this message should
-      // engage the agent at all and, if so, in "act" (full tool access —
-      // explicit mention, or a reply to the agent's own recent question) or
-      // "suggest" (passive event-detection only, no mutating tools) mode.
-      // agentNames is deliberately omitted so decideEngagement reads
-      // AGENT_NAMES/AGENT_IMESSAGE_HANDLE from env itself.
-      const last = await loadLastOutboundMessage(chatGuid);
-      const decision = await decideEngagement({
-        text,
-        lastAgentMessage: last ? { text: last.text, sentAt: last.createdAt } : undefined,
+      await processInboundMessage({
+        imessageGuid: data.guid,
+        chatGuid: extractChatGuid(data),
+        senderHandle: data.handle?.address,
+        text: typeof data.text === "string" ? data.text : "",
+        isFromMe: data.isFromMe,
       });
-
-      if (!decision.engage) {
-        // Precision-over-recall, per tech-lead's ruling (docs/agent-core.md
-        // §9, "open design question #1"): ordinary group-chat chatter the
-        // gate correctly ignores gets no message_log row at all, not even a
-        // DB write — a console line is enough of a debugging trail for
-        // tuning the gate later.
-        console.info("[api/webhooks/bluebubbles] gate: silent", { reason: decision.reason, textLen: text.length });
-        return;
-      }
-
-      // v1: pass just this single inbound message as the whole `messages`
-      // array handed to runAgent explicitly — runAgent itself now loads
-      // recent message_log rows for this thread as prior-turn context
-      // internally (Level-1 conversation memory, docs/agent-core.md §2d),
-      // so this is not the whole story the model sees, just what this
-      // webhook passes as the newly-arrived turn.
-      const result = await runAgent({
-        messages: [{ role: "user", content: text }],
-        source: "imessage",
-        chatGuid,
-        senderHandle,
-        // decision.mode is never "silent" here since decision.engage is true.
-        engagementMode: decision.mode === "suggest" ? "suggest" : "act",
-      });
-      await enqueueOutbound(chatGuid, result.reply);
     } catch (err) {
-      console.error("[api/webhooks/bluebubbles] runAgent failed", err);
+      console.error("[api/webhooks/bluebubbles] processInboundMessage failed", err);
     }
   });
 
