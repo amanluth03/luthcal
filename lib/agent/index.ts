@@ -9,15 +9,9 @@ import type { LuthEvent } from "@/lib/google/types";
 import { dedupeHistory, formatHistory, loadRecentThreadHistory } from "./history";
 import type { RosterMember } from "./match-member";
 import { formatMemoriesForPrompt, loadActiveMemories, type MemoryRow } from "./memory";
+import { AGENT_MODEL } from "./model";
 import { resolveSenderMemberId } from "./resolve-sender";
 import { buildAgentTools, type AgentSource } from "./tools";
-
-// Model is addressed via a Vercel AI Gateway string, resolved by the
-// AI SDK's built-in global provider (no explicit `gateway(...)` import
-// needed — see node_modules/ai/docs/.../ai-gateway reference). Reading this
-// as a plain string constant (not from env) keeps model selection a code
-// change, per the task brief; AI_GATEWAY_API_KEY / Vercel OIDC supplies auth.
-const MODEL = "anthropic/claude-sonnet-5";
 
 // A single conversational turn is: parse -> maybe list/create/update/delete
 // -> checkConflicts -> reply. 8 steps gives headroom for a multi-part
@@ -314,7 +308,7 @@ export async function runAgent({ messages, source, chatGuid, senderHandle, engag
   const modelMessages: ModelMessage[] = coalesceConsecutiveRoles([...formatHistory(dedupeHistory(history, messages), source), ...callerModelMessages]);
 
   const result = await generateText({
-    model: MODEL,
+    model: AGENT_MODEL,
     system,
     messages: modelMessages,
     tools,

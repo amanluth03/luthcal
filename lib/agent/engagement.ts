@@ -24,6 +24,8 @@
 import { generateText, Output } from "ai";
 import { z } from "zod";
 
+import { CLASSIFIER_MODEL } from "./model";
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -235,9 +237,9 @@ function isPendingConfirmationReply(lastAgentMessage: LastAgentMessage | undefin
 // ---------------------------------------------------------------------------
 
 /**
- * Model for the passive event-with-time classifier — deliberately DIFFERENT
- * from (and much cheaper/faster than) `lib/agent/index.ts`'s `MODEL`
- * (`"anthropic/claude-sonnet-5"`, the full tool-loop agent).
+ * The passive event-with-time classifier uses `CLASSIFIER_MODEL` from
+ * ./model.ts — deliberately DIFFERENT from (and much cheaper/faster than)
+ * the full tool-loop agent's `AGENT_MODEL` (Claude Sonnet 5).
  *
  * **Why a separate, cheaper model — cost/latency reasoning:** every message
  * in the family group chat that isn't an explicit mention has to be
@@ -256,8 +258,6 @@ function isPendingConfirmationReply(lastAgentMessage: LastAgentMessage | undefin
  * capped low (the only output is one small JSON boolean) to bound cost and
  * latency further per call.
  */
-const CLASSIFIER_MODEL = "anthropic/claude-haiku-4-5";
-
 const CLASSIFIER_MAX_OUTPUT_TOKENS = 300;
 
 const CLASSIFIER_SYSTEM_PROMPT = `You are a fast pre-filter for a family calendar assistant that passively monitors a family group chat. You will be given a single message from that chat. Decide whether it CLEARLY AND UNAMBIGUOUSLY describes a specific, schedulable calendar event that includes an explicit date or time — a day of the week, a calendar date, "tomorrow", "tonight", "next Friday", a clock time, etc.
