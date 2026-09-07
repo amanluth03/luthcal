@@ -105,6 +105,28 @@ export const messageLog = pgTable("message_log", {
     .defaultNow(),
 });
 
+// Durable things the family has told the agent to remember (preferences,
+// standing patterns, decisions), shared across the iMessage and dashboard
+// channels. Rows are archived rather than deleted so a mistaken "forget"
+// from either the agent or the dashboard can be undone.
+export const familyMemory = pgTable("family_memory", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  content: text("content").notNull(),
+  kind: text("kind", { enum: ["preference", "pattern", "fact", "decision"] })
+    .notNull()
+    .default("fact"),
+  memberId: uuid("member_id"),
+  createdByMemberId: uuid("created_by_member_id"),
+  source: text("source", { enum: ["imessage", "dashboard"] }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+});
+
 export const settings = pgTable("settings", {
   key: text("key").primaryKey(),
   value: jsonb("value"),
