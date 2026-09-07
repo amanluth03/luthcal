@@ -25,7 +25,7 @@ interface WireMessage {
 /**
  * Dashboard chat with the agent. Posts to /api/chat — owned by senior-backend
  * and being built in parallel, so this degrades gracefully rather than
- * assuming the endpoint is reachable (e.g. AI_GATEWAY_API_KEY unset locally):
+ * assuming the endpoint is reachable (e.g. ANTHROPIC_API_KEY unset locally):
  *  - a failed/missing/non-JSON response marks that message "Not Delivered"
  *    (an intentional nod to the iMessage bridge this whole product is built
  *    on) instead of throwing, and surfaces a one-time explanatory note.

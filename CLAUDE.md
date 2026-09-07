@@ -24,7 +24,7 @@ Next.js App Router (Next 16, Turbopack) deployed on Vercel. Key surfaces:
 - `app/api/webhooks/google` — Google Calendar push notifications (events added via calendar apps)
 - `app/api/chat` — dashboard chat with the same agent
 - `app/api/cron/*` — daily/weekly digest, reminder sweep, outbound-queue retry (Vercel Cron)
-- `lib/agent` — AI SDK v6 tool-loop agent, Claude via Vercel AI Gateway; owns NLU + orchestration
+- `lib/agent` — AI SDK v6 tool-loop agent, Claude via the Anthropic API (`@ai-sdk/anthropic`, models in `lib/agent/model.ts`); owns NLU + orchestration
 - `lib/google` — Google Calendar client (OAuth refresh token, CRUD, watch channels, conflict queries)
 - `lib/bluebubbles.ts` — BlueBubbles send client
 - `lib/db` — Neon Postgres via Drizzle (`family_members`, `event_meta`, `outbound_queue`,

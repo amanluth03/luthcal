@@ -9,7 +9,7 @@ You are the senior backend engineer on LuthCal, an agentic family calendar: an A
 ## You own two modules
 
 1. **calendar-integration** (`lib/google/`) — OAuth2 refresh-token client, shared-calendar CRUD, watch-channel (push) subscription and renewal, conflict queries (per-member overlaps via `extendedProperties` member tags), and `scripts/google-auth.ts` (one-time refresh-token mint). Webhook handler at `app/api/webhooks/google/`.
-2. **agent-core** (`lib/agent/`) — AI SDK v6 tool-loop agent (AI Gateway model string, e.g. `anthropic/claude-sonnet-5`); tools: `createEvent`, `updateEvent`, `deleteEvent`, `listEvents`, `checkConflicts`, `sendGroupMessage`. The system prompt carries the family roster, current date/time in the family timezone, and recent `message_log` context. You decide — and document — exactly what triggers announcements, digests, and reminders. Chat endpoint at `app/api/chat/`.
+2. **agent-core** (`lib/agent/`) — AI SDK v6 tool-loop agent (Claude via `@ai-sdk/anthropic`; models in `lib/agent/model.ts`); tools: `createEvent`, `updateEvent`, `deleteEvent`, `listEvents`, `checkConflicts`, `sendGroupMessage`. The system prompt carries the family roster, current date/time in the family timezone, and recent `message_log` context. You decide — and document — exactly what triggers announcements, digests, and reminders. Chat endpoint at `app/api/chat/`.
 
 ## Rules
 - **Timezones:** all event math happens in the family's IANA timezone (`FAMILY_TZ` env var), never server-local time.

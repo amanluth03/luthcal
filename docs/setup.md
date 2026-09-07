@@ -3,7 +3,7 @@
 Everything you need to take LuthCal from a passing build to a running system.
 Work top to bottom; each section fills in one group of `.env.local` variables
 (the manifest is `.env.example`). Nothing here costs money except Claude API
-usage, which is billed through the Vercel AI Gateway at a few cents/day for a
+usage, which is billed by Anthropic at a few cents/day for a
 family's message volume.
 
 ```
@@ -36,20 +36,18 @@ Fills: `DATABASE_URL`
 
 ---
 
-## 2. AI Gateway — the agent's brain
+## 2. Anthropic API key — the agent's brain
 
-The agent talks to Claude through the **Vercel AI Gateway** (unified endpoint,
-observability, spend controls). We use a plain model string —
-`anthropic/claude-sonnet-5` — resolved by the gateway; there is no
-provider-specific SDK to install.
+The agent talks to Claude directly through the Anthropic API (the AI SDK's
+`@ai-sdk/anthropic` provider). Two models are used: Claude Sonnet 5 for the
+tool-loop agent and Claude Haiku 4.5 for the passive-listener classifier.
 
-1. In the Vercel dashboard: **AI Gateway → API Keys → Create**.
-2. Put the key in `AI_GATEWAY_API_KEY`.
+1. At [console.anthropic.com](https://console.anthropic.com) → **API Keys → Create Key**.
+2. Put the key in `ANTHROPIC_API_KEY`.
 
-That's the only agent credential. To change the model, edit the string in
-`lib/agent/index.ts` (e.g. `anthropic/claude-opus-4-8` for harder reasoning).
+That's the only agent credential. To change a model, edit `lib/agent/model.ts`.
 
-Fills: `AI_GATEWAY_API_KEY`
+Fills: `ANTHROPIC_API_KEY`
 
 ---
 
@@ -151,7 +149,7 @@ and the Google watch channel + BlueBubbles webhook deliver real-time updates.
 | Variable | Section | Purpose |
 |---|---|---|
 | `DATABASE_URL` | §1 | Neon Postgres |
-| `AI_GATEWAY_API_KEY` | §2 | Claude via AI Gateway |
+| `ANTHROPIC_API_KEY` | §2 | Claude via the Anthropic API |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | §3a | OAuth client |
 | `GOOGLE_REFRESH_TOKEN` | §3b | long-lived Google auth |
 | `FAMILY_CALENDAR_ID` | §3c | the shared calendar |

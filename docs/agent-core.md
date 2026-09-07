@@ -45,9 +45,10 @@ is called out explicitly in the `endISO` tool-parameter description (see
 all-day event on Tuesday" (inclusive) — without the explicit instruction the
 model would reliably get this wrong.
 
-Model: AI Gateway string `"anthropic/claude-sonnet-5"`, resolved by the AI
-SDK's built-in global provider (no explicit `gateway(...)` import needed;
-`AI_GATEWAY_API_KEY` / Vercel OIDC supplies auth). `generateText` is called
+Model: Claude Sonnet 5 via the AI SDK's `@ai-sdk/anthropic` provider
+(`AGENT_MODEL` in `lib/agent/model.ts`; `ANTHROPIC_API_KEY` supplies auth —
+the Vercel AI Gateway was dropped when its free tier stopped serving
+Anthropic models). `generateText` is called
 directly (not the `ToolLoopAgent` class) because the system prompt and tool
 context (roster, current time, `createdVia`, destination chat) are rebuilt
 per-request from the DB/env rather than fixed at agent-definition time.
