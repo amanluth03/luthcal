@@ -24,7 +24,7 @@ interface FakeMessageLogRow {
   createdAt: Date;
 }
 
-const state = vi.hoisted(() => ({ rows: [] as FakeMessageLogRow[], nextId: 1 }));
+const state = vi.hoisted(() => ({ rows: [] as FakeMessageLogRow[], nextId: 1, claims: new Set<string>() }));
 
 vi.mock("drizzle-orm", () => ({
   eq: (column: unknown, value: unknown) => ({ op: "eq" as const, column, value }),
@@ -92,9 +92,23 @@ vi.mock("@/lib/db", () => ({
           },
         };
       },
-      insert() {
+      insert(table: unknown) {
         return {
           values(vals: Partial<FakeMessageLogRow>) {
+            if (table === inboundClaims) {
+              // The atomic claim: INSERT ... ON CONFLICT DO NOTHING RETURNING —
+              // an empty result means someone else already holds the guid.
+              return {
+                onConflictDoNothing: () => ({
+                  returning: () => {
+                    const guid = vals.imessageGuid as string;
+                    if (state.claims.has(guid)) return Promise.resolve([]);
+                    state.claims.add(guid);
+                    return Promise.resolve([{ guid }]);
+                  },
+                }),
+              };
+            }
             state.rows.push({
               id: `row-${state.nextId++}`,
               direction: "inbound",
@@ -125,27 +139,15 @@ const enqueueOutboundMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/agent/outbound", () => ({ enqueueOutbound: enqueueOutboundMock }));
 
 // Imported AFTER the mocks above so the module under test picks them up.
-import { messageLog } from "@/lib/db/schema";
+import { inboundClaims, messageLog } from "@/lib/db/schema";
 import { processInboundMessage } from "@/lib/inbound-processor";
 
 const FAMILY_CHAT = "chat-family";
 
-function seedRow(row: Partial<FakeMessageLogRow> & { direction: "inbound" | "outbound"; text: string }) {
-  state.rows.push({
-    id: `row-${state.nextId++}`,
-    source: null,
-    chatGuid: null,
-    senderHandle: null,
-    memberId: null,
-    imessageGuid: null,
-    createdAt: new Date(),
-    ...row,
-  });
-}
-
 beforeEach(() => {
   state.rows = [];
   state.nextId = 1;
+  state.claims = new Set();
   runAgentMock.mockReset();
   decideEngagementMock.mockReset();
   enqueueOutboundMock.mockReset();
@@ -211,37 +213,37 @@ describe("processInboundMessage", () => {
     expect(decideEngagementMock).not.toHaveBeenCalled();
   });
 
-  it("short-circuits to 'already-processed' when an inbound row with the same imessageGuid already exists, without calling the gate", async () => {
-    seedRow({ direction: "inbound", chatGuid: FAMILY_CHAT, imessageGuid: "dup-guid", text: "Maya has dentist Tuesday 3pm" });
+  it("claims the guid atomically: a second sighting of the same message returns 'already-processed' without touching the gate", async () => {
+    decideEngagementMock.mockResolvedValue({ engage: true, reason: "mentioned", mode: "act" });
+    runAgentMock.mockResolvedValue({ reply: "Added.", actions: [] });
+    const msg = { imessageGuid: "dup-guid", chatGuid: FAMILY_CHAT, senderHandle: "aman@example.com", text: "LuthCal, add dentist Tuesday 3pm" };
 
-    const result = await processInboundMessage({
-      imessageGuid: "dup-guid",
-      chatGuid: FAMILY_CHAT,
-      senderHandle: "aman@example.com",
-      text: "Maya has dentist Tuesday 3pm",
-    });
+    expect(await processInboundMessage(msg)).toBe("engaged");
+    expect(await processInboundMessage(msg)).toBe("already-processed");
 
-    expect(result).toBe("already-processed");
-    expect(decideEngagementMock).not.toHaveBeenCalled();
-    expect(runAgentMock).not.toHaveBeenCalled();
-    expect(enqueueOutboundMock).not.toHaveBeenCalled();
-    // No new row written for the short-circuited duplicate.
-    expect(state.rows).toHaveLength(1);
+    expect(decideEngagementMock).toHaveBeenCalledTimes(1);
+    expect(runAgentMock).toHaveBeenCalledTimes(1);
+    expect(enqueueOutboundMock).toHaveBeenCalledTimes(1);
   });
 
-  it("does NOT short-circuit an outbound row sharing the same guid (only inbound rows count as already-processed)", async () => {
-    seedRow({ direction: "outbound", chatGuid: FAMILY_CHAT, imessageGuid: "dup-guid", text: "Done!" });
+  it("two sightings racing each other (webhook + poller) run the agent exactly once", async () => {
+    decideEngagementMock.mockResolvedValue({ engage: true, reason: "mentioned", mode: "act" });
+    runAgentMock.mockResolvedValue({ reply: "Added.", actions: [] });
+    const msg = { imessageGuid: "race-guid", chatGuid: FAMILY_CHAT, senderHandle: "aman@example.com", text: "LuthCal, add dinner Wednesday 7pm" };
+
+    const results = await Promise.all([processInboundMessage(msg), processInboundMessage(msg)]);
+
+    expect(results.sort()).toEqual(["already-processed", "engaged"]);
+    expect(runAgentMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a message with no guid can never be treated as already processed", async () => {
     decideEngagementMock.mockResolvedValue({ engage: false, reason: "none", mode: "silent" });
+    const msg = { chatGuid: FAMILY_CHAT, senderHandle: "aman@example.com", text: "hey" };
 
-    const result = await processInboundMessage({
-      imessageGuid: "dup-guid",
-      chatGuid: FAMILY_CHAT,
-      senderHandle: "aman@example.com",
-      text: "hey",
-    });
-
-    expect(result).toBe("silent");
-    expect(decideEngagementMock).toHaveBeenCalledTimes(1);
+    expect(await processInboundMessage(msg)).toBe("silent");
+    expect(await processInboundMessage(msg)).toBe("silent");
+    expect(decideEngagementMock).toHaveBeenCalledTimes(2);
   });
 
   it("gate silent: no message_log rows are written at all (ambient chatter gets zero footprint)", async () => {

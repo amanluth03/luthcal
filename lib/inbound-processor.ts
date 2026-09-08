@@ -1,12 +1,10 @@
-import { and, eq } from "drizzle-orm";
-
 import { runAgent } from "@/lib/agent";
 import { decideEngagement } from "@/lib/agent/engagement";
 import { loadLastOutboundMessage } from "@/lib/agent/history";
 import { MAX_INBOUND_LENGTH, normalizeInboundText } from "@/lib/agent/normalize-inbound";
 import { enqueueOutbound } from "@/lib/agent/outbound";
 import { getDb } from "@/lib/db";
-import { messageLog } from "@/lib/db/schema";
+import { inboundClaims, messageLog } from "@/lib/db/schema";
 
 // Per-message inbound pipeline, extracted out of
 // app/api/webhooks/bluebubbles/route.ts so app/api/cron/inbound (the
@@ -45,26 +43,25 @@ async function logInbound(chatGuid: string | undefined, senderHandle: string | u
 }
 
 /**
- * True if an inbound message_log row with this guid already exists — the
- * webhook (push) and the inbound-poll cron (pull) can both see the same
- * BlueBubbles message, and this is what stops the second sighting from
- * running the gate/agent/outbound-enqueue a second time. Fails open (returns
- * false) on a DB error, same posture as every other best-effort DB read in
- * this codebase — a rare double-process on a transient DB hiccup is a far
- * smaller problem than never engaging at all.
+ * Atomically claims a BlueBubbles message guid for this run. The webhook
+ * (push) and the inbound-poll cron (pull) can see the same message within
+ * the same second, and a read-then-write check lets both through; a single
+ * INSERT ... ON CONFLICT DO NOTHING can only succeed for one of them. Fails
+ * open (returns true) on a DB error — a rare double-process on a transient
+ * DB hiccup is a smaller problem than never engaging at all.
  */
-async function hasAlreadyProcessed(imessageGuid: string): Promise<boolean> {
+async function claimInbound(imessageGuid: string): Promise<boolean> {
   try {
     const db = getDb();
-    const rows = await db
-      .select({ id: messageLog.id })
-      .from(messageLog)
-      .where(and(eq(messageLog.direction, "inbound"), eq(messageLog.imessageGuid, imessageGuid)))
-      .limit(1);
-    return rows.length > 0;
+    const claimed = await db
+      .insert(inboundClaims)
+      .values({ imessageGuid })
+      .onConflictDoNothing()
+      .returning({ guid: inboundClaims.imessageGuid });
+    return claimed.length > 0;
   } catch (err) {
-    console.error("[lib/inbound-processor] failed to check already-processed guid (continuing)", err);
-    return false;
+    console.error("[lib/inbound-processor] failed to claim inbound guid (continuing)", err);
+    return true;
   }
 }
 
@@ -121,7 +118,7 @@ export async function processInboundMessage(msg: InboundMessage): Promise<Proces
   // only checked past the cheap filters above, and only guards the
   // gate/runAgent/enqueue path below (the actually side-effecting part); a
   // duplicate wrong-chat/empty audit row above would be harmless anyway.
-  if (imessageGuid && (await hasAlreadyProcessed(imessageGuid))) {
+  if (imessageGuid && !(await claimInbound(imessageGuid))) {
     return "already-processed";
   }
 

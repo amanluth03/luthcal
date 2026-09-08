@@ -113,6 +113,17 @@ export const messageLog = pgTable("message_log", {
     .defaultNow(),
 }, (table) => [index("message_log_imessage_guid_idx").on(table.imessageGuid)]);
 
+// One row per BlueBubbles message guid the inbound pipeline has taken on.
+// The webhook and the inbound-poll cron can see the same message within the
+// same second; inserting here with ON CONFLICT DO NOTHING is the atomic
+// claim that lets exactly one of them run the agent.
+export const inboundClaims = pgTable("inbound_claims", {
+  imessageGuid: text("imessage_guid").primaryKey(),
+  claimedAt: timestamp("claimed_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 // Durable things the family has told the agent to remember (preferences,
 // standing patterns, decisions), shared across the iMessage and dashboard
 // channels. Rows are archived rather than deleted so a mistaken "forget"
