@@ -11,6 +11,7 @@ import type { RosterMember } from "./match-member";
 import { formatMemoriesForPrompt, loadActiveMemories, type MemoryRow } from "./memory";
 import { AGENT_MODEL } from "./model";
 import { resolveSenderMemberId } from "./resolve-sender";
+import { describeSender } from "./sender-context";
 import { isAgentSilent } from "./silent";
 import { buildAgentTools, type AgentSource } from "./tools";
 
@@ -122,7 +123,13 @@ function formatRoster(roster: RosterMember[]): string {
     .join("\n");
 }
 
-function buildSystemPrompt(source: AgentSource, roster: RosterMember[], mode: "act" | "suggest", memories: MemoryRow[]): string {
+function buildSystemPrompt(
+  source: AgentSource,
+  roster: RosterMember[],
+  mode: "act" | "suggest",
+  memories: MemoryRow[],
+  sender: { memberId?: string; handle?: string },
+): string {
   const tz = getFamilyTimeZone();
 
   return `You are LuthCal, the scheduling assistant for the Luthra family. You normally live in their iMessage group chat${
@@ -149,6 +156,8 @@ ${formatRoster(roster)}
 Things the family has asked you to remember:
 ${formatMemoriesForPrompt(memories, roster)}
 
+Current message sender: ${describeSender(sender.memberId, sender.handle, roster)}
+
 How to operate:
 1. Parse who the event is for, what it is, and when. When calling createEvent/updateEvent, pass memberNames as the name/alias text you read in the conversation (e.g. "Maya", "mom") — do NOT resolve those names to ids yourself; that's done deterministically, outside your control, against the roster above. The read-only tools are the one exception: checkConflicts and listEvents take member *ids*, not names — use the \`id:\` values shown in the roster above for those.
 2. If createEvent/updateEvent returns an ambiguousMember result instead of a created/updated event, the name you gave matched more than one family member (listed in candidates). Do not retry with a guess — ask the user which person they meant, then call the tool again once they've told you. If instead it returns unresolvedMemberNames alongside a created/updated event, those names matched nobody on the roster and were left off the event — briefly note that in your reply (e.g. "I didn't recognize 'Emma' as a family member, so I didn't tag anyone") so a typo or a missing roster entry gets caught, but don't block on it.
@@ -161,7 +170,8 @@ How to operate:
 9. Earlier turns from message_log may appear above this instruction as prior conversation context, some possibly prefixed with "Name: " to show who said it in a group chat — treat them as real conversation history (e.g. resolving "make it 4 instead" against an event discussed a few turns ago), not as something to repeat back or comment on.
 10. Save a memory (the \`remember\` tool) when someone explicitly asks you to remember something, or states a durable scheduling preference, standing pattern, or decision in a message addressed to you. Say "I'll remember that" in your reply.
 11. Don't use \`remember\` for one-off events (that's the calendar, via createEvent) or for things only inferred from unaddressed chatter.
-12. Use \`searchHistory\` when someone refers to an earlier conversation that isn't in the recent turns shown above.`;
+12. Use \`searchHistory\` when someone refers to an earlier conversation that isn't in the recent turns shown above.
+13. First-person words in the message you're answering ("me", "my", "I", "mine") refer to the person under "Current message sender" — pass that roster name as memberNames. Only if the sender is unknown should a first-person request make you ask who it's for.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +317,7 @@ export async function runAgent({ messages, source, chatGuid, senderHandle, engag
   }
 
   const memories = await loadActiveMemories();
-  const system = buildSystemPrompt(source, roster, mode, memories);
+  const system = buildSystemPrompt(source, roster, mode, memories, { memberId: senderMemberId, handle: senderHandle });
   const tools = buildAgentTools({ source, chatGuid, roster, mode, senderMemberId });
 
   const callerModelMessages: ModelMessage[] = messages.map((m): ModelMessage =>
